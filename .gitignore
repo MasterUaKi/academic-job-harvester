@@ -1,0 +1,24 @@
+# File: .gitignore
+# Version: 0.5.0 | Release Date: 2026-11-24
+
+# Virtual environments & Python artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Local runtime state, SQLite databases, uploaded CVs & secrets
+.env
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

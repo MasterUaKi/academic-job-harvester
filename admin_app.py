@@ -1,40 +1,28 @@
 # File: admin_app.py
-# Version: 0.5.0 | Release Date: 2026-11-24
-# EN: Academic Job Harvester v0.5.0 — Adds one-click Anschreiben (DE) and
-#     Cover Letter (EN) draft generation tailored to each vacancy and uploaded CV.
-# DE: Academic Job Harvester v0.5.0 — Ergänzt die Generierung von Anschreiben (DE)
-#     und Cover Letter (EN) passend zur ausgewählten Stelle und zum Lebenslauf.
+# Version: 1.0.0 | Release Date: 2026-11-25
+# EN: Text-only Academic Job Harvester v1.0.0 command center with System 1 / System 2
+#     integration, interactive facet filters/sorting, CV matching, Anschreiben/Cover
+#     Letter generator, and CSV/JSON export (voice input completely removed).
+# DE: Reines Text-Dashboard `admin_app.py` v1.0.0 für Academic Job Harvester ohne
+#     Spracheingabe, mit System 1/2, Filter-Chips, Anschreiben und CSV/JSON-Export.
 
 from __future__ import annotations
 
 import asyncio
-import io
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-import httpx
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 _LOCAL_PYCOGNITION_SRC = Path(r"C:\Entwiklung\pycognition\src")
 if _LOCAL_PYCOGNITION_SRC.exists() and str(_LOCAL_PYCOGNITION_SRC) not in sys.path:
     sys.path.insert(0, str(_LOCAL_PYCOGNITION_SRC))
-
-try:
-    import pypdf
-except ImportError:
-    pypdf = None  # type: ignore
-
-try:
-    import docx
-except ImportError:
-    docx = None  # type: ignore
 
 try:
     from pycognition.temporal import (
@@ -51,6 +39,14 @@ except ImportError:
     _HAS_PYCOGNITION_TEMPORAL = False
 
 from core.cognitive_job_engine import CognitiveJobSkillEngine
+from core.cover_letter_generator import build_letter_draft, polish_letter_via_deepseek
+from core.cv_matcher import (
+    build_cv_profile,
+    extract_text_from_upload,
+    load_cv_profile,
+    score_and_filter_jobs,
+)
+from core.job_exporter import render_jobs_csv_bytes, render_jobs_json
 
 try:
     from adapters.bundesagentur_adapter import BundesagenturJobAdapter
@@ -63,7 +59,7 @@ except ImportError:
     EURAXESSAndNiedersachsenAdapter = None  # type: ignore
 
 
-app = FastAPI(title="Academic Job Harvester — PyCognition System 1 / System 2 Center", version="0.5.0")
+app = FastAPI(title="Academic Job Harvester — PyCognition Command Center", version="1.0.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -71,8 +67,28 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CV_STATE_PATH = DATA_DIR / "active_cv_profile.json"
 JOBS_CACHE_PATH = DATA_DIR / "harvested_jobs.json"
 
-
 cognitive_engine = CognitiveJobSkillEngine(base_dir=BASE_DIR, data_dir=DATA_DIR)
+
+
+def _classify_org_type(institution: str, source_portal: str = "") -> str:
+    txt = f"{institution} {source_portal}".lower()
+    if any(
+        k in txt
+        for k in (
+            "max-planck", "max planck", "fraunhofer", "helmholtz", "leibniz",
+            "dlr", "forschungszentrum", "institut", "awi", "tib", "forschungsinstitut",
+        )
+    ):
+        return "НИИ / Forschungsinstitut"
+    if any(k in txt for k in ("hochschule", "haw", "fh ", "fachhochschule")):
+        return "Hochschule / HAW"
+    if any(k in txt for k in ("universität", "universitaet", "uni ", "tu ", "rwth", "lmu", "kit")):
+        return "Universität"
+    if "euraxess" in txt:
+        return "EURAXESS / EU"
+    if "bundesagentur" in txt or "arbeitsagentur" in txt:
+        return "Bundesagentur"
+    return "Академическая организация"
 
 
 class AcademicTemporalBridge:
@@ -200,6 +216,10 @@ def _load_jobs() -> List[Dict[str, Any]]:
             if u.startswith(("https://", "http://")):
                 item["url"] = u
                 item["link"] = u
+                item["org_type"] = _classify_org_type(
+                    str(item.get("institution") or ""),
+                    str(item.get("source_portal") or ""),
+                )
                 valid.append(item)
         return valid
     except Exception:
@@ -210,21 +230,42 @@ def _save_jobs(jobs: List[Dict[str, Any]]) -> None:
     JOBS_CACHE_PATH.write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _filtered_jobs(
+    q: str = "",
+    org_type: str = "",
+    institution: str = "",
+    pay_grade: str = "",
+    workload: str = "",
+    contract: str = "",
+    horizon: str = "",
+    sort_by: str = "match",
+) -> List[Dict[str, Any]]:
+    cv = load_cv_profile(CV_STATE_PATH)
+    return score_and_filter_jobs(
+        _load_jobs(),
+        cv.get("skills", []),
+        query_filter=q,
+        org_type_filter=org_type,
+        institution_filter=institution,
+        pay_grade_filter=pay_grade,
+        workload_filter=workload,
+        contract_filter=contract,
+        horizon_filter=horizon,
+        sort_by=sort_by,
+    )
+
+
 HARVEST_STATE: Dict[str, Any] = {
     "running": False,
     "system2_busy": False,
     "progress": 100,
     "active_source": "Готов · Нажмите «▶ ЗАПУСТИТЬ СБОР (СИСТЕМА 1)» или «🧠 ОБУЧИТЬ СИСТЕМУ 2»",
-    "last_run": "2026-11-24 09:10 CET",
+    "last_run": "2026-11-25 10:38 CET",
     "raw_collected": 0,
     "unique_canonical": 0,
     "last_api_hits": 0,
     "last_errors": [],
 }
-
-
-class VoiceQueryRequest(BaseModel):
-    transcript: str
 
 
 class TeachSourceRequest(BaseModel):
@@ -237,218 +278,19 @@ class CoverLetterRequest(BaseModel):
     lang: str = "de"
 
 
-KNOWN_SKILL_LEXICON = [
-    "python", "dspace", "dspace-cris", "cris", "kdsf", "solr", "sqlite", "postgresql",
-    "rest api", "docker", "typescript", "angular", "rdm", "fdm", "datacite", "doi",
-    "dms", "sap", "ai", "llm", "knowledge graph", "forschungsförderung", "eu horizon",
-    "projektmanagement", "innovation management", "transfer", "open source", "automation",
-    "analytics", "german b2", "english", "forschung", "wissenschaft", "tv-l e13", "tv-l e14",
-    "universität vechta", "niedersachsen", "research",
-]
-
-
-def _extract_text_from_upload(filename: str, content: bytes) -> str:
-    lower = filename.lower()
-    if lower.endswith(".pdf") and pypdf is not None:
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    if lower.endswith(".docx") and docx is not None:
-        doc = docx.Document(io.BytesIO(content))
-        return "\n".join(p.text for p in doc.paragraphs)
-    return content.decode("utf-8", errors="ignore")
-
-
-def _build_cv_profile(filename: str, raw_text: str) -> Dict[str, Any]:
-    clean = re.sub(r"\s+", " ", raw_text).strip()
-    lower = clean.lower()
-    detected_skills = [kw for kw in KNOWN_SKILL_LEXICON if kw in lower]
-    if not detected_skills:
-        words = re.findall(r"[A-Za-zÄÖÜäöüß\-]{4,}", lower)
-        freq: Dict[str, int] = {}
-        for w in words:
-            freq[w] = freq.get(w, 0) + 1
-        detected_skills = [k for k, _ in sorted(freq.items(), key=lambda x: -x[1])[:12]]
-
-    profile = {
-        "filename": filename,
-        "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "char_count": len(clean),
-        "skills": detected_skills,
-        "preview": clean[:240],
-    }
-    CV_STATE_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-    return profile
-
-
-def _load_cv_profile() -> Dict[str, Any]:
-    if CV_STATE_PATH.is_file():
-        try:
-            return json.loads(CV_STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {
-        "filename": "Default Profile",
-        "uploaded_at": "2026-11-24",
-        "char_count": 0,
-        "skills": ["python", "dspace-cris", "kdsf", "rest api", "rdm", "ai", "innovation management"],
-        "preview": "Перетащите PDF/DOCX резюме сюда для расчёта совпадений.",
-    }
-
-
-def _score_jobs(jobs: List[Dict[str, Any]], cv_skills: List[str], query_filter: str = "") -> List[Dict[str, Any]]:
-    cv_set = {s.lower() for s in cv_skills}
-    q = query_filter.lower().strip()
-    enriched: List[Dict[str, Any]] = []
-
-    for job in jobs:
-        job_tags = [str(t).lower() for t in (job.get("tags") or [])]
-        matched = [t for t in job_tags if t in cv_set]
-        missing = [t for t in job_tags if t not in cv_set]
-        score = int(round((len(matched) / max(1, len(job_tags))) * 100))
-
-        haystack = " ".join([
-            str(job.get("title") or ""),
-            str(job.get("institution") or ""),
-            str(job.get("location") or ""),
-            str(job.get("pay_grade") or ""),
-            str(job.get("workload") or ""),
-            str(job.get("contract") or ""),
-            str(job.get("source_portal") or ""),
-            *job_tags,
-        ]).lower()
-
-        if q:
-            tokens = [tok for tok in re.split(r"[\s,;]+", q) if len(tok) >= 2]
-            if tokens and not any(tok in haystack for tok in tokens):
-                continue
-
-        item = dict(job)
-        item["match_score"] = min(99, max(20, score))
-        item["matched_tags"] = matched
-        item["missing_tags"] = missing[:3]
-        enriched.append(item)
-
-    enriched.sort(key=lambda x: -x["match_score"])
-    return enriched
-
-
-def _parse_voice_intent(transcript: str) -> Dict[str, Any]:
-    text = transcript.strip()
-    lower = text.lower()
-    extracted_filters: List[str] = []
-
-    for grade in ("e13", "e14", "e15", "tv-l", "tvöd", "w1", "w2", "w3"):
-        if grade in lower:
-            extracted_filters.append(grade.upper())
-    if "100" in lower or "полн" in lower or "vollzeit" in lower:
-        extracted_filters.append("100%")
-    if "unbefristet" in lower or "бессроч" in lower:
-        extracted_filters.append("Unbefristet")
-    for region in ("niedersachsen", "нижн", "hannover", "oldenburg", "bremen", "vechta", "euraxess", "remote", "удален", "удалён", "hybrid"):
-        if region in lower:
-            extracted_filters.append(region)
-
-    if not extracted_filters:
-        extracted_filters = [w for w in re.findall(r"[A-Za-zА-Яа-яЁёÄÖÜäöüß0-9\-]{3,}", text) if len(w) >= 3][:4]
-
-    return {
-        "transcript": text,
-        "filter_query": " ".join(extracted_filters),
-        "detected_chips": extracted_filters,
-    }
-
-
-def _build_letter_draft(job: Dict[str, Any], cv: Dict[str, Any], lang: str) -> str:
-    title = str(job.get("title") or "Wissenschaftliche Position")
-    institution = str(job.get("institution") or "Hochschule / Forschungseinrichtung")
-    location = str(job.get("location") or "Deutschland")
-    pay_grade = str(job.get("pay_grade") or "TV-L")
-    workload = str(job.get("workload") or "100%")
-    kennziffer = str(job.get("kennziffer") or "")
-    url = str(job.get("url") or "")
-    skills = [str(s) for s in (cv.get("skills") or [])[:8]]
-    skills_str = ", ".join(skills) if skills else "Python, Research Information Systems, RDM, AI Automation"
-    cv_name = str(cv.get("filename") or "Bewerberprofil")
-
-    if lang.lower().startswith("en"):
-        return (
-            f"Subject: Application for {title}"
-            f"{f' (Ref.: {kennziffer})' if kennziffer else ''}\n\n"
-            f"Dear Hiring Committee at {institution},\n\n"
-            f"I am writing to express my strong interest in the position of \"{title}\" "
-            f"({location}, {pay_grade}, {workload}). Based on my background profile ({cv_name}), "
-            f"I bring hands-on experience in {skills_str}, combining software engineering, "
-            f"research data/information architecture, and structured project coordination.\n\n"
-            f"I am eager to contribute to {institution}'s research and innovation goals and look forward "
-            f"to discussing how my technical and organizational expertise aligns with this role.\n"
-            f"{f'Posting reference: {url}\n' if url else ''}\n"
-            f"Sincerely,\n[Your Name]"
-        )
-
-    return (
-        f"Bewerbung um die Stelle als „{title}“"
-        f"{f' (Kennziffer: {kennziffer})' if kennziffer else ''}\n\n"
-        f"Sehr geehrte Damen und Herren,\n\n"
-        f"mit großem Interesse bewerbe ich mich auf die ausgeschriebene Position „{title}“ "
-        f"bei {institution} ({location}, Vergütung: {pay_grade}, Umfang: {workload}). "
-        f"Auf Basis meines hinterlegten Profils ({cv_name}) bringe ich fundierte Praxis in den Bereichen "
-        f"{skills_str} mit und verbinde technische Systementwicklung mit Forschungsorganisation und Transfer.\n\n"
-        f"Gerne unterstütze ich {institution} mit einer strukturierten, lösungsorientierten Arbeitsweise "
-        f"und freue mich auf ein persönliches oder digitales Gespräch.\n"
-        f"{f'Ausschreibungslink: {url}\n' if url else ''}\n"
-        f"Mit freundlichen Grüßen\n[Ihr Name]"
-    )
-
-
-async def _polish_letter_via_deepseek(draft: str, lang: str) -> str:
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return draft
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").strip().rstrip("/")
-    model = os.getenv("PYCOGNITION_FAST_MODEL", "deepseek-chat").strip()
-    target_lang = "English" if lang.lower().startswith("en") else "German"
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=8.0)) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "temperature": 0.3,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": f"Polish this academic job application letter in natural, idiomatic {target_lang}. Keep facts accurate and concise.",
-                        },
-                        {"role": "user", "content": draft},
-                    ],
-                },
-            )
-            resp.raise_for_status()
-            polished = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-            return polished if len(polished) > 60 else draft
-    except Exception:
-        return draft
-
-
 async def _execute_system1_cycle() -> None:
     HARVEST_STATE["running"] = True
     HARVEST_STATE["progress"] = 20
     HARVEST_STATE["active_source"] = "Система 1: запуск кристаллизованных скиллов (skills_registry/)..."
     HARVEST_STATE["last_errors"] = []
 
-    collected: List[Dict[str, Any]] = []
-
-    s1_records = await cognitive_engine.run_system1_harvest()
-    collected.extend(s1_records)
-
+    collected: List[Dict[str, Any]] = await cognitive_engine.run_system1_harvest()
     HARVEST_STATE["progress"] = 55
     HARVEST_STATE["active_source"] = "Tier-1 Адаптеры: Bundesagentur API & EURAXESS..."
 
     if BundesagenturJobAdapter is not None:
         try:
-            ba = BundesagenturJobAdapter(size=25, require_academic_match=True)
-            b_batch = await ba.fetch_changes()
+            b_batch = await BundesagenturJobAdapter(size=25, require_academic_match=True).fetch_changes()
             HARVEST_STATE["last_api_hits"] = int(b_batch.metadata.get("api_raw_hits", 0))
             collected.extend(b_batch.records)
         except Exception as exc:
@@ -456,8 +298,7 @@ async def _execute_system1_cycle() -> None:
 
     if EURAXESSAndNiedersachsenAdapter is not None:
         try:
-            nds = EURAXESSAndNiedersachsenAdapter()
-            n_batch = await nds.fetch_changes()
+            n_batch = await EURAXESSAndNiedersachsenAdapter().fetch_changes()
             collected.extend(n_batch.records)
         except Exception as exc:
             HARVEST_STATE["last_errors"].append(str(exc))
@@ -468,31 +309,27 @@ async def _execute_system1_cycle() -> None:
         if u.startswith(("https://", "http://")):
             dedup_by_url[u] = rec
 
-    real_jobs = list(dedup_by_url.values())
     HARVEST_STATE["progress"] = 85
     HARVEST_STATE["active_source"] = "PyCognition TemporalEventGraph & EntityResolver..."
-
     resolved_jobs = await temporal_bridge.ingest_jobs(
-        real_jobs,
+        list(dedup_by_url.values()),
         source_name="PyCognition System 1 + Tier-1 Adapters",
     )
     _save_jobs(resolved_jobs)
 
+    s1_cnt = cognitive_engine.stats["system1_skills_count"]
+    s1_ms = cognitive_engine.stats["system1_avg_ms"]
     HARVEST_STATE["raw_collected"] = len(collected) + HARVEST_STATE["last_api_hits"]
     HARVEST_STATE["unique_canonical"] = len(resolved_jobs)
     HARVEST_STATE["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     HARVEST_STATE["progress"] = 100
-    HARVEST_STATE["active_source"] = (
-        f"Готово · Собрано {len(resolved_jobs)} вакансий "
-        f"(Скиллов Системы 1: {cognitive_engine.stats['system1_skills_count']}, "
-        f"ср. время: {cognitive_engine.stats['system1_avg_ms']} мс)"
-    )
+    HARVEST_STATE["active_source"] = f"Готово · Вакансий: {len(resolved_jobs)} (Скиллов S1: {s1_cnt}, {s1_ms} мс)"
     HARVEST_STATE["running"] = False
 
 
 async def _execute_system2_discovery_cycle() -> None:
     HARVEST_STATE["system2_busy"] = True
-    HARVEST_STATE["active_source"] = "Система 2 (HRK / Hochschulkompass): поиск вузов и синтез скиллов..."
+    HARVEST_STATE["active_source"] = "Система 2: поиск источников и синтез скиллов..."
     try:
         await cognitive_engine.discover_and_build_adapters(max_new_sources=6)
         await _execute_system1_cycle()
@@ -501,11 +338,19 @@ async def _execute_system2_discovery_cycle() -> None:
 
 
 @app.get("/api/dashboard")
-async def get_dashboard_state(q: str = "") -> JSONResponse:
-    cv = _load_cv_profile()
+async def get_dashboard_state(
+    q: str = "",
+    org_type: str = "",
+    institution: str = "",
+    pay_grade: str = "",
+    workload: str = "",
+    contract: str = "",
+    horizon: str = "",
+    sort_by: str = "match",
+) -> JSONResponse:
+    cv = load_cv_profile(CV_STATE_PATH)
     all_jobs = _load_jobs()
-    jobs = _score_jobs(all_jobs, cv.get("skills", []), query_filter=q)
-    skills_list = cognitive_engine.list_skills_status()
+    jobs = _filtered_jobs(q, org_type, institution, pay_grade, workload, contract, horizon, sort_by)
 
     pay_dist: Dict[str, int] = {}
     horizon_dist: Dict[str, int] = {"H1": 0, "H2": 0, "H3": 0}
@@ -515,12 +360,17 @@ async def get_dashboard_state(q: str = "") -> JSONResponse:
         h = str(j.get("horizon") or "H3")
         horizon_dist[h] = horizon_dist.get(h, 0) + 1
 
-    high_match_count = sum(1 for j in jobs if j["match_score"] >= 60)
-
     return JSONResponse({
         "harvest": HARVEST_STATE,
         "cognition_stats": cognitive_engine.stats,
-        "system1_skills": skills_list,
+        "system1_skills": cognitive_engine.list_skills_status(),
+        "facets": {
+            "org_types": sorted({_classify_org_type(str(j.get("institution") or ""), str(j.get("source_portal") or "")) for j in all_jobs}),
+            "institutions": sorted({str(j.get("institution") or "") for j in all_jobs if j.get("institution")}),
+            "pay_grades": sorted({str(j.get("pay_grade") or "TV-L / Tarif") for j in all_jobs}),
+            "workloads": sorted({str(j.get("workload") or "Siehe Ausschreibung") for j in all_jobs}),
+            "contracts": sorted({str(j.get("contract") or "Ausschreibung") for j in all_jobs}),
+        },
         "temporal_stats": {
             "enabled": temporal_bridge.enabled,
             "canonical_entities": len(all_jobs),
@@ -532,12 +382,38 @@ async def get_dashboard_state(q: str = "") -> JSONResponse:
         "funnel": {
             "raw": max(HARVEST_STATE["raw_collected"], len(all_jobs)),
             "unique": len(all_jobs),
-            "matched": high_match_count,
+            "matched": sum(1 for j in jobs if j["match_score"] >= 60),
         },
         "pay_distribution": pay_dist,
         "horizon_distribution": horizon_dist,
         "jobs": jobs[:50],
     })
+
+
+@app.get("/api/export/json")
+async def export_jobs_json(
+    q: str = "", org_type: str = "", institution: str = "", pay_grade: str = "",
+    workload: str = "", contract: str = "", horizon: str = "", sort_by: str = "match",
+) -> Response:
+    jobs = _filtered_jobs(q, org_type, institution, pay_grade, workload, contract, horizon, sort_by)
+    return Response(
+        content=render_jobs_json(jobs),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="academic_jobs.json"'},
+    )
+
+
+@app.get("/api/export/csv")
+async def export_jobs_csv(
+    q: str = "", org_type: str = "", institution: str = "", pay_grade: str = "",
+    workload: str = "", contract: str = "", horizon: str = "", sort_by: str = "match",
+) -> Response:
+    jobs = _filtered_jobs(q, org_type, institution, pay_grade, workload, contract, horizon, sort_by)
+    return Response(
+        content=render_jobs_csv_bytes(jobs),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="academic_jobs.csv"'},
+    )
 
 
 @app.post("/api/harvest/toggle")
@@ -546,7 +422,6 @@ async def toggle_harvest() -> JSONResponse:
         HARVEST_STATE["running"] = False
         HARVEST_STATE["active_source"] = "Остановлено пользователем"
         return JSONResponse(HARVEST_STATE)
-
     asyncio.create_task(_execute_system1_cycle())
     return JSONResponse(HARVEST_STATE)
 
@@ -567,147 +442,71 @@ async def teach_system2_source(req: TeachSourceRequest) -> JSONResponse:
 
 @app.post("/api/cover-letter")
 async def generate_cover_letter(req: CoverLetterRequest) -> JSONResponse:
-    cv = _load_cv_profile()
-    jobs = _load_jobs()
-    job = next((item for item in jobs if str(item.get("id")) == req.job_id), None)
+    cv = load_cv_profile(CV_STATE_PATH)
+    job = next((item for item in _load_jobs() if str(item.get("id")) == req.job_id), None)
     if not job:
-        return JSONResponse({"status": "error", "letter": "Вакансия не найдена в текущем каталоге."}, status_code=404)
-
-    base_draft = _build_letter_draft(job=job, cv=cv, lang=req.lang)
-    final_text = await _polish_letter_via_deepseek(draft=base_draft, lang=req.lang)
-    return JSONResponse({
-        "status": "ok",
-        "job_title": job.get("title"),
-        "institution": job.get("institution"),
-        "lang": req.lang,
-        "letter": final_text,
-    })
+        return JSONResponse({"status": "error", "letter": "Вакансия не найдена."}, status_code=404)
+    draft = build_letter_draft(job=job, cv=cv, lang=req.lang)
+    polished = await polish_letter_via_deepseek(draft=draft, lang=req.lang)
+    return JSONResponse({"status": "ok", "job_title": job.get("title"), "institution": job.get("institution"), "lang": req.lang, "letter": polished})
 
 
 @app.post("/api/cv/upload")
 async def upload_cv(file: UploadFile = File(...)) -> JSONResponse:
     content = await file.read()
-    text = _extract_text_from_upload(file.filename or "resume.txt", content)
-    profile = _build_cv_profile(file.filename or "resume.txt", text)
+    text = extract_text_from_upload(file.filename or "resume.txt", content)
+    profile = build_cv_profile(file.filename or "resume.txt", text, CV_STATE_PATH)
     return JSONResponse({"status": "ok", "profile": profile})
 
 
-@app.post("/api/voice/parse")
-async def parse_voice_command(req: VoiceQueryRequest) -> JSONResponse:
-    return JSONResponse(_parse_voice_intent(req.transcript))
-
-
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Academic Job Harvester · PyCognition System 1 / System 2</title>
+  <title>Academic Job Harvester · PyCognition v1.0</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <style>
-    :root {
-      --bg: #0b1120;
-      --card: #131c31;
-      --border: #243354;
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-      --green: #10b981;
-      --blue: #3b82f6;
-      --amber: #f59e0b;
-      --purple: #8b5cf6;
-    }
+    :root { --bg: #0b1120; --card: #131c31; --border: #243354; --text: #f1f5f9; --muted: #94a3b8; --green: #10b981; --blue: #3b82f6; --amber: #f59e0b; --purple: #8b5cf6; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      padding: 20px;
-    }
-    .header {
-      display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
-    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
     .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-badge {
-      background: linear-gradient(135deg, var(--blue), var(--purple));
-      padding: 8px 14px; border-radius: 12px; font-weight: 800; font-size: 17px;
-    }
-    .big-controls {
-      display: grid; grid-template-columns: 1.1fr 1.15fr 1fr 1fr; gap: 14px; margin-bottom: 20px;
-    }
-    .control-tile {
-      background: var(--card); border: 2px solid var(--border); border-radius: 18px;
-      padding: 16px; display: flex; flex-direction: column; justify-content: space-between;
-    }
-    .btn-giant {
-      width: 100%; padding: 15px 12px; border: none; border-radius: 14px;
-      font-size: 15px; font-weight: 800; color: #fff; cursor: pointer;
-      display: flex; align-items: center; justify-content: center; gap: 8px;
-      box-shadow: 0 8px 20px rgba(0,0,0,0.3);
-    }
+    .brand-badge { background: linear-gradient(135deg, var(--blue), var(--purple)); padding: 8px 14px; border-radius: 12px; font-weight: 800; font-size: 17px; }
+    .big-controls { display: grid; grid-template-columns: 1.1fr 1.2fr 1fr; gap: 14px; margin-bottom: 18px; }
+    .control-tile { background: var(--card); border: 2px solid var(--border); border-radius: 18px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; }
+    .btn-giant { width: 100%; padding: 15px 12px; border: none; border-radius: 14px; font-size: 15px; font-weight: 800; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; }
     .btn-start { background: linear-gradient(135deg, #059669, #10b981); }
     .btn-stop  { background: linear-gradient(135deg, #dc2626, #ef4444); }
     .btn-sys2  { background: linear-gradient(135deg, #7c3aed, #8b5cf6); }
-    .btn-mic   { background: linear-gradient(135deg, #2563eb, #3b82f6); }
-    .btn-mic.listening { background: linear-gradient(135deg, #d97706, #f59e0b); animation: pulse 1.2s infinite; }
-    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.02); } 100% { transform: scale(1); } }
-
-    .progress-bar {
-      height: 8px; background: #1e293b; border-radius: 999px; overflow: hidden; margin-top: 10px;
-    }
+    .progress-bar { height: 8px; background: #1e293b; border-radius: 999px; overflow: hidden; margin-top: 10px; }
     .progress-fill { height: 100%; background: var(--green); width: 100%; transition: width 0.4s; }
-
-    .drop-zone {
-      border: 2px dashed #475569; border-radius: 14px; padding: 12px; text-align: center;
-      cursor: pointer; background: rgba(30, 41, 59, 0.45); transition: 0.2s;
-    }
+    .drop-zone { border: 2px dashed #475569; border-radius: 14px; padding: 12px; text-align: center; cursor: pointer; background: rgba(30, 41, 59, 0.45); }
     .drop-zone.dragover { border-color: var(--green); background: rgba(16, 185, 129, 0.15); }
     .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-    .chip {
-      font-size: 11px; padding: 3px 9px; border-radius: 999px;
-      background: rgba(59, 130, 246, 0.2); border: 1px solid rgba(59, 130, 246, 0.45); color: #93c5fd;
-    }
-    .chip-s1 {
-      font-size: 11px; padding: 4px 10px; border-radius: 999px;
-      background: rgba(16, 185, 129, 0.16); border: 1px solid rgba(16, 185, 129, 0.45); color: #6ee7b7;
-    }
-
-    .charts-grid {
-      display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px;
-    }
-    .chart-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px;
-    }
-    .chart-card h3 { font-size: 13px; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .chip { font-size: 11px; padding: 3px 9px; border-radius: 999px; background: rgba(59, 130, 246, 0.2); border: 1px solid rgba(59, 130, 246, 0.45); color: #93c5fd; }
+    .chip-s1 { font-size: 11px; padding: 4px 10px; border-radius: 999px; background: rgba(16, 185, 129, 0.16); border: 1px solid rgba(16, 185, 129, 0.45); color: #6ee7b7; }
+    .facets-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 18px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 10px; }
+    .facet-group { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .facet-label { font-size: 11px; color: var(--muted); font-weight: 700; min-width: 125px; text-transform: uppercase; }
+    .facet-btn { background: #1e293b; color: #cbd5e1; border: 1px solid var(--border); padding: 5px 11px; border-radius: 999px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .facet-btn.active { background: linear-gradient(135deg, #2563eb, #7c3aed); color: #fff; border-color: transparent; }
+    .sort-select { background: #0f172a; color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 9px; font-size: 12px; font-weight: 600; }
+    .charts-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+    .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; }
+    .chart-card h3 { font-size: 13px; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; }
     .chart-wrap { height: 180px; position: relative; }
-
-    .skills-bar {
-      background: var(--card); border: 1px solid var(--border); border-radius: 16px;
-      padding: 14px 18px; margin-bottom: 20px;
-    }
-
-    .jobs-section {
-      background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 18px;
-    }
-    .job-row {
-      display: grid; grid-template-columns: 84px 1fr auto; gap: 16px; align-items: center;
-      padding: 14px; border-bottom: 1px solid var(--border);
-    }
+    .skills-bar { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 18px; margin-bottom: 20px; }
+    .jobs-section { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 18px; }
+    .jobs-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 10px; flex-wrap: wrap; }
+    .export-group { display: flex; gap: 8px; align-items: center; }
+    .btn-export { background: #1e293b; color: #e2e8f0; border: 1px solid var(--border); padding: 7px 12px; border-radius: 9px; font-size: 12px; font-weight: 700; cursor: pointer; }
+    .job-row { display: grid; grid-template-columns: 84px 1fr auto; gap: 16px; align-items: center; padding: 14px; border-bottom: 1px solid var(--border); }
     .job-row:last-child { border-bottom: none; }
     .job-actions { display: flex; flex-direction: column; gap: 8px; min-width: 155px; }
-    .btn-open {
-      background: #1e293b; color: #f8fafc; padding: 9px 12px; border-radius: 10px;
-      text-decoration: none; font-size: 12px; font-weight: 700; border: 1px solid var(--border); text-align: center;
-    }
-    .btn-letter {
-      background: rgba(59, 130, 246, 0.18); color: #93c5fd; padding: 8px 10px; border-radius: 10px;
-      border: 1px solid rgba(59, 130, 246, 0.45); font-size: 11px; font-weight: 700; cursor: pointer;
-    }
-    .score-badge {
-      width: 74px; height: 74px; border-radius: 16px; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; font-weight: 800; font-size: 20px;
-      background: rgba(16, 185, 129, 0.16); border: 2px solid var(--green); color: #6ee7b7;
-    }
+    .btn-open { background: #1e293b; color: #f8fafc; padding: 9px 12px; border-radius: 10px; text-decoration: none; font-size: 12px; font-weight: 700; border: 1px solid var(--border); text-align: center; }
+    .btn-letter { background: rgba(59, 130, 246, 0.18); color: #93c5fd; padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(59, 130, 246, 0.45); font-size: 11px; font-weight: 700; cursor: pointer; }
+    .score-badge { width: 74px; height: 74px; border-radius: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-weight: 800; font-size: 20px; background: rgba(16, 185, 129, 0.16); border: 2px solid var(--green); color: #6ee7b7; }
     .score-badge.mid { background: rgba(245, 158, 11, 0.16); border-color: var(--amber); color: #fcd34d; }
     .score-badge span { font-size: 10px; font-weight: 600; color: var(--muted); }
     .meta-pills { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; font-size: 12px; }
@@ -715,50 +514,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .pill-src { background: rgba(139, 92, 246, 0.2); border: 1px solid rgba(139, 92, 246, 0.45); color: #ddd6fe; padding: 3px 10px; border-radius: 8px; }
     .tag-ok { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; padding: 2px 8px; border-radius: 6px; font-size: 11px; }
     .tag-miss { background: rgba(245, 158, 11, 0.18); color: #fcd34d; padding: 2px 8px; border-radius: 6px; font-size: 11px; }
-    .voice-input {
-      width: 100%; margin-top: 8px; padding: 8px 10px; border-radius: 10px;
-      border: 1px solid var(--border); background: #0f172a; color: var(--text); font-size: 13px;
-    }
+    .text-input { width: 100%; margin-top: 8px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0f172a; color: var(--text); font-size: 13px; }
     .teach-row { display: flex; gap: 6px; margin-top: 8px; }
-    .btn-mini {
-      background: #334155; color: #fff; border: none; border-radius: 9px;
-      padding: 0 12px; font-weight: 700; cursor: pointer; font-size: 12px;
-    }
+    .btn-mini { background: #334155; color: #fff; border: none; border-radius: 9px; padding: 0 12px; font-weight: 700; cursor: pointer; font-size: 12px; }
     .empty-state { padding: 26px; text-align: center; color: var(--muted); font-size: 14px; }
-
-    /* Modal for Anschreiben / Cover Letter */
-    .modal-backdrop {
-      display: none; position: fixed; inset: 0; background: rgba(2, 6, 23, 0.78);
-      align-items: center; justify-content: center; z-index: 999; padding: 20px;
-    }
+    .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(2, 6, 23, 0.78); align-items: center; justify-content: center; z-index: 999; padding: 20px; }
     .modal-backdrop.open { display: flex; }
-    .modal-box {
-      background: var(--card); border: 2px solid var(--border); border-radius: 18px;
-      width: 100%; max-width: 720px; padding: 20px; box-shadow: 0 24px 48px rgba(0,0,0,0.6);
-    }
-    .letter-area {
-      width: 100%; min-height: 290px; margin: 12px 0; padding: 14px; border-radius: 12px;
-      border: 1px solid var(--border); background: #0b1120; color: var(--text);
-      font-family: inherit; font-size: 13px; line-height: 1.5; resize: vertical;
-    }
+    .modal-box { background: var(--card); border: 2px solid var(--border); border-radius: 18px; width: 100%; max-width: 720px; padding: 20px; }
+    .letter-area { width: 100%; min-height: 290px; margin: 12px 0; padding: 14px; border-radius: 12px; border: 1px solid var(--border); background: #0b1120; color: var(--text); font-family: inherit; font-size: 13px; line-height: 1.5; }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="brand">
-      <div class="brand-badge">PyCognition v1.3 · S1/S2</div>
+      <div class="brand-badge">PyCognition v1.0</div>
       <div>
-        <h1 style="font-size:19px;">Academic Job Harvester · Когнитивный пульт управления</h1>
-        <div id="temporalMeta" style="font-size:12px; color:var(--muted);">Система 1 + Система 2 + Генератор Anschreiben / Cover Letter</div>
+        <h1 style="font-size:19px;">Academic Job Harvester · Пульт управления (текстовый режим)</h1>
+        <div id="temporalMeta" style="font-size:12px; color:var(--muted);">Система 1 + Система 2 · Поиск, фильтрация и отклики</div>
       </div>
     </div>
-    <div id="cognitionBadge" style="font-size:12px; color:#c4b5fd; font-weight:600;">⚡ Скиллов S1: 0 · Синтезов S2: 0</div>
+    <div id="cognitionBadge" style="font-size:12px; color:#c4b5fd; font-weight:600;">⚡ S1 Скиллов: 0 · Синтезов S2: 0</div>
   </div>
 
   <div class="big-controls">
     <div class="control-tile">
       <div>
-        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">1 · СИСТЕМА 1 (БЫСТРЫЙ СБОР)</div>
+        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">1 · СИСТЕМА 1 (СБОР ВАКАНСИЙ)</div>
         <button id="harvestBtn" class="btn-giant btn-start" onclick="toggleHarvest()">▶ ЗАПУСТИТЬ СБОР</button>
       </div>
       <div>
@@ -766,34 +547,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div id="sourceLabel" style="font-size:11px; color:var(--muted); margin-top:6px;">Ожидание запуска</div>
       </div>
     </div>
-
     <div class="control-tile">
       <div>
-        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">2 · СИСТЕМА 2 (HRK / ВУЗЫ / СИНТЕЗ)</div>
+        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">2 · СИСТЕМА 2 (ПОИСК ВУЗОВ И СИНТЕЗ)</div>
         <button id="sys2Btn" class="btn-giant btn-sys2" onclick="runSystem2Discovery()">🧠 НАЙТИ ИСТОЧНИКИ И АДАПТЕРЫ</button>
       </div>
       <div>
         <div class="teach-row">
-          <input id="teachUrlInput" class="voice-input" style="margin-top:0;" placeholder="Вставьте URL вуза (напр. uni-muenster.de/...)" />
+          <input id="teachUrlInput" class="text-input" style="margin-top:0;" placeholder="Вставьте URL вуза (напр. uni-muenster.de/...)" />
           <button class="btn-mini" onclick="teachNewUrl()">+ Обучить</button>
         </div>
-        <div id="sys2Log" style="font-size:11px; color:#c4b5fd; margin-top:6px;">Автопоиск и AST-синтез</div>
+        <div id="sys2Log" style="font-size:11px; color:#c4b5fd; margin-top:6px;">Эскалация до 5 шагов</div>
       </div>
     </div>
-
     <div class="control-tile">
-      <div>
-        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">3 · ГОЛОСОВОЙ ФИЛЬТР</div>
-        <button id="micBtn" class="btn-giant btn-mic" onclick="startVoiceSearch()">🎤 СКАЗАТЬ, ЧТО ИСКАТЬ</button>
-      </div>
-      <div>
-        <input id="searchInput" class="voice-input" placeholder="E13, Vechta, Oldenburg, PDF..." oninput="refreshDashboard()" />
-        <div id="voiceChips" class="chip-row"></div>
-      </div>
-    </div>
-
-    <div class="control-tile">
-      <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">4 · ПЕРЕТАЩИТЕ РЕЗЮМЕ (PDF/DOCX)</div>
+      <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">3 · ПЕРЕТАЩИТЕ РЕЗЮМЕ (PDF/DOCX)</div>
       <div id="dropZone" class="drop-zone" onclick="document.getElementById('cvFile').click()">
         <div style="font-size:20px;">📄⬇️</div>
         <div id="cvTitle" style="font-weight:700; font-size:13px; margin-top:3px;">Бросьте резюме сюда</div>
@@ -801,6 +569,39 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <input id="cvFile" type="file" accept=".pdf,.docx,.txt" style="display:none" onchange="uploadCVFile(this.files[0])" />
       </div>
       <div id="cvSkills" class="chip-row"></div>
+    </div>
+  </div>
+
+  <div class="facets-panel">
+    <div class="facet-group">
+      <span class="facet-label">🔎 ТЕКСТОВЫЙ ПОИСК:</span>
+      <input id="searchInput" class="text-input" style="margin-top:0; max-width:420px;" placeholder="Ключевые слова: E13, Vechta, Oldenburg, CRIS, PDF..." oninput="refreshDashboard()" />
+    </div>
+    <div class="facet-group"><span class="facet-label">🏢 ТИП ВУЗА / НИИ:</span><div id="orgTypeChips" style="display:flex; flex-wrap:wrap; gap:6px;"></div></div>
+    <div class="facet-group"><span class="facet-label">🏛 ОРГАНИЗАЦИЯ:</span><div id="institutionChips" style="display:flex; flex-wrap:wrap; gap:6px;"></div></div>
+    <div class="facet-group"><span class="facet-label">💶 ТАРИФ:</span><div id="payGradeChips" style="display:flex; flex-wrap:wrap; gap:6px;"></div></div>
+    <div class="facet-group"><span class="facet-label">⏱ ЗАНЯТОСТЬ:</span><div id="workloadChips" style="display:flex; flex-wrap:wrap; gap:6px;"></div></div>
+    <div class="facet-group"><span class="facet-label">📄 ФОРМАТ / СРОК:</span><div id="contractChips" style="display:flex; flex-wrap:wrap; gap:6px;"></div></div>
+    <div class="facet-group" style="justify-content:space-between;">
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:6px;">
+        <span class="facet-label">⏳ ГОРИЗОНТ:</span>
+        <button class="facet-btn active" data-hz="" onclick="setHorizon('')">Все</button>
+        <button class="facet-btn" data-hz="H1" onclick="setHorizon('H1')">H1 (≤2 дн)</button>
+        <button class="facet-btn" data-hz="H2" onclick="setHorizon('H2')">H2 (3–14 дн)</button>
+        <button class="facet-btn" data-hz="H3" onclick="setHorizon('H3')">H3 (14+ дн)</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:11px; color:var(--muted); font-weight:700;">СОРТИРОВКА:</span>
+        <select id="sortSelect" class="sort-select" onchange="setSortBy(this.value)">
+          <option value="match">По совпадению с CV (%)</option>
+          <option value="org_type">По типу организации (ВУЗ / НИИ)</option>
+          <option value="institution">По названию организации (A–Z)</option>
+          <option value="pay_grade">По тарифному разряду</option>
+          <option value="workload">По занятости / ставке</option>
+          <option value="title">По названию вакансии (A–Z)</option>
+        </select>
+        <button class="btn-export" onclick="resetAllFilters()">↺ Сбросить</button>
+      </div>
     </div>
   </div>
 
@@ -813,29 +614,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="charts-grid">
-    <div class="chart-card">
-      <h3>1. Воронка дедупликации PyCognition</h3>
-      <div class="chart-wrap"><canvas id="funnelChart"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <h3>2. Тарифные группы (TV-L / TVöD / W)</h3>
-      <div class="chart-wrap"><canvas id="payChart"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <h3>3. Радар дедлайнов (H1 / H2 / H3)</h3>
-      <div class="chart-wrap"><canvas id="horizonChart"></canvas></div>
-    </div>
+    <div class="chart-card"><h3>1. Воронка дедупликации PyCognition</h3><div class="chart-wrap"><canvas id="funnelChart"></canvas></div></div>
+    <div class="chart-card"><h3>2. Тарифные группы (TV-L / TVöD / W)</h3><div class="chart-wrap"><canvas id="payChart"></canvas></div></div>
+    <div class="chart-card"><h3>3. Радар дедлайнов (H1 / H2 / H3)</h3><div class="chart-wrap"><canvas id="horizonChart"></canvas></div></div>
   </div>
 
   <div class="jobs-section">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-      <h2 style="font-size:16px;">🎯 Реальные вакансии с прямыми ссылками и генератором письма</h2>
-      <span id="jobsCount" style="font-size:13px; color:var(--muted);"></span>
+    <div class="jobs-header">
+      <h2 style="font-size:16px;">🎯 Реальные вакансии с прямыми ссылками</h2>
+      <div class="export-group">
+        <span id="jobsCount" style="font-size:13px; color:var(--muted);"></span>
+        <button class="btn-export" onclick="exportJobs('csv')">⬇ CSV</button>
+        <button class="btn-export" onclick="exportJobs('json')">⬇ JSON</button>
+      </div>
     </div>
     <div id="jobsList"></div>
   </div>
 
-  <!-- MODAL FOR ANSCHREIBEN / COVER LETTER -->
   <div id="letterModal" class="modal-backdrop" onclick="if(event.target===this)closeLetterModal()">
     <div class="modal-box">
       <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -852,120 +647,121 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <script>
-    let funnelChart, payChart, horizonChart;
-    let currentLetterLang = 'de';
+    let funnelChart, payChart, horizonChart, currentLetterLang = 'de', lastChartSignature = '';
+    let activeOrgType = '', activeInstitution = '', activePayGrade = '', activeWorkload = '', activeContract = '', activeHorizon = '', activeSortBy = 'match';
 
+    function buildQueryParams() {
+      return new URLSearchParams({
+        q: document.getElementById('searchInput').value || '',
+        org_type: activeOrgType, institution: activeInstitution, pay_grade: activePayGrade,
+        workload: activeWorkload, contract: activeContract, horizon: activeHorizon, sort_by: activeSortBy,
+      }).toString();
+    }
+    function exportJobs(fmt) { window.open(`/api/export/${fmt}?${buildQueryParams()}`, '_blank'); }
+    function toggleFacet(kind, val) {
+      if (kind === 'org_type') activeOrgType = (activeOrgType === val) ? '' : val;
+      if (kind === 'institution') activeInstitution = (activeInstitution === val) ? '' : val;
+      if (kind === 'pay_grade') activePayGrade = (activePayGrade === val) ? '' : val;
+      if (kind === 'workload') activeWorkload = (activeWorkload === val) ? '' : val;
+      if (kind === 'contract') activeContract = (activeContract === val) ? '' : val;
+      refreshDashboard();
+    }
+    function setHorizon(hz) {
+      activeHorizon = hz;
+      document.querySelectorAll('[data-hz]').forEach(b => b.classList.toggle('active', b.getAttribute('data-hz') === hz));
+      refreshDashboard();
+    }
+    function setSortBy(val) { activeSortBy = val; refreshDashboard(); }
+    function resetAllFilters() {
+      activeOrgType = activeInstitution = activePayGrade = activeWorkload = activeContract = activeHorizon = '';
+      activeSortBy = 'match';
+      document.getElementById('searchInput').value = '';
+      document.getElementById('sortSelect').value = 'match';
+      setHorizon('');
+    }
+    function chipButtons(items, activeVal, kind, limit) {
+      return (items || []).slice(0, limit).map(v => {
+        const act = activeVal.toLowerCase() === String(v).toLowerCase();
+        const safe = String(v).replace(/'/g, "\\'");
+        return `<button class="facet-btn ${act ? 'active' : ''}" onclick="toggleFacet('${kind}', '${safe}')">${v}</button>`;
+      }).join('');
+    }
+    function renderFacetChips(data) {
+      const f = data.facets || {};
+      document.getElementById('orgTypeChips').innerHTML = chipButtons(f.org_types, activeOrgType, 'org_type', 10) || '<span style="font-size:12px;color:var(--muted);">Появятся после сбора</span>';
+      document.getElementById('institutionChips').innerHTML = chipButtons(f.institutions, activeInstitution, 'institution', 12);
+      document.getElementById('payGradeChips').innerHTML = chipButtons(f.pay_grades, activePayGrade, 'pay_grade', 10);
+      document.getElementById('workloadChips').innerHTML = chipButtons(f.workloads, activeWorkload, 'workload', 8);
+      document.getElementById('contractChips').innerHTML = chipButtons(f.contracts, activeContract, 'contract', 8);
+    }
     async function refreshDashboard() {
-      const q = document.getElementById('searchInput').value || '';
-      const res = await fetch('/api/dashboard?q=' + encodeURIComponent(q));
-      const data = await res.json();
-
+      const data = await (await fetch('/api/dashboard?' + buildQueryParams())).json();
       const btn = document.getElementById('harvestBtn');
-      if (data.harvest.running) {
-        btn.className = 'btn-giant btn-stop';
-        btn.innerHTML = '⏹ СТОП (' + data.harvest.progress + '%)';
-      } else {
-        btn.className = 'btn-giant btn-start';
-        btn.innerHTML = '▶ ЗАПУСТИТЬ СБОР';
-      }
+      btn.className = data.harvest.running ? 'btn-giant btn-stop' : 'btn-giant btn-start';
+      btn.innerHTML = data.harvest.running ? `⏹ СТОП (${data.harvest.progress}%)` : '▶ ЗАПУСТИТЬ СБОР';
       document.getElementById('progressFill').style.width = data.harvest.progress + '%';
       document.getElementById('sourceLabel').textContent = data.harvest.active_source;
 
       if (data.cognition_stats) {
         const cs = data.cognition_stats;
         document.getElementById('cognitionBadge').textContent =
-          `⚡ S1 Скиллов: ${cs.system1_skills_count} (${cs.system1_avg_ms} мс) · S2 Синтезов: ${cs.system2_synthesized} · S2 Ремонтов: ${cs.system2_repaired}`;
+          `⚡ S1: ${cs.system1_skills_count} (${cs.system1_avg_ms} мс) · S2: ${cs.system2_synthesized} · Шагов: ${cs.system2_max_attempts || 5}`;
         document.getElementById('sys2Log').textContent = cs.last_system2_log || '';
       }
-
       if (data.temporal_stats) {
         document.getElementById('temporalMeta').textContent =
-          `Уникальных вакансий: ${data.temporal_stats.canonical_entities} · Склеено дублей: ${data.temporal_stats.aliases_merged} · Горизонт H1-H3: ${data.temporal_stats.planned_actions}`;
+          `Уникальных вакансий: ${data.temporal_stats.canonical_entities} · Склеено дублей: ${data.temporal_stats.aliases_merged}`;
       }
+      renderFacetChips(data);
 
       const skills = data.system1_skills || [];
-      const activeSkills = skills.filter(s => s.crystallized);
-      document.getElementById('skillsSummary').textContent = `Активно ${activeSkills.length} из ${skills.length} источников`;
+      document.getElementById('skillsSummary').textContent = `Активно ${skills.filter(s => s.crystallized).length} из ${skills.length}`;
       document.getElementById('skillsChips').innerHTML = skills.map(s =>
         `<span class="${s.crystallized ? 'chip-s1' : 'chip'}">${s.crystallized ? '✓' : '⏳'} ${s.institution || s.name}</span>`
       ).join('');
 
       document.getElementById('cvTitle').textContent = '✅ ' + data.cv_profile.filename;
       document.getElementById('cvSub').textContent = data.cv_profile.preview;
-      document.getElementById('cvSkills').innerHTML = (data.cv_profile.skills || [])
-        .slice(0, 6).map(s => `<span class="chip">${s}</span>`).join('');
+      document.getElementById('cvSkills').innerHTML = (data.cv_profile.skills || []).slice(0, 6).map(s => `<span class="chip">${s}</span>`).join('');
 
-      renderCharts(data);
+      const sig = JSON.stringify({ funnel: data.funnel, pay: data.pay_distribution, horizon: data.horizon_distribution });
+      if (sig !== lastChartSignature) { lastChartSignature = sig; renderCharts(data); }
       renderJobs(data.jobs);
     }
-
     function renderCharts(data) {
-      const commonOpts = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#cbd5e1', font: { size: 11 } } } } };
-
+      const opts = { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { labels: { color: '#cbd5e1', font: { size: 11 } } } } };
       if (funnelChart) funnelChart.destroy();
       funnelChart = new Chart(document.getElementById('funnelChart'), {
         type: 'bar',
-        data: {
-          labels: ['Проверено', 'Прямые ссылки', 'Подходят под CV'],
-          datasets: [{
-            data: [data.funnel.raw, data.funnel.unique, data.funnel.matched],
-            backgroundColor: ['#3b82f6', '#8b5cf6', '#10b981'],
-            borderRadius: 8
-          }]
-        },
-        options: { ...commonOpts, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } }
+        data: { labels: ['Проверено', 'Прямые ссылки', 'Подходят под CV'], datasets: [{ data: [data.funnel.raw, data.funnel.unique, data.funnel.matched], backgroundColor: ['#3b82f6', '#8b5cf6', '#10b981'], borderRadius: 8 }] },
+        options: { ...opts, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } }
       });
-
       if (payChart) payChart.destroy();
       payChart = new Chart(document.getElementById('payChart'), {
         type: 'doughnut',
-        data: {
-          labels: Object.keys(data.pay_distribution).length ? Object.keys(data.pay_distribution) : ['Ожидание'],
-          datasets: [{
-            data: Object.values(data.pay_distribution).length ? Object.values(data.pay_distribution) : [1],
-            backgroundColor: ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b', '#ec4899'],
-            borderWidth: 0
-          }]
-        },
-        options: commonOpts
+        data: { labels: Object.keys(data.pay_distribution).length ? Object.keys(data.pay_distribution) : ['Ожидание'], datasets: [{ data: Object.values(data.pay_distribution).length ? Object.values(data.pay_distribution) : [1], backgroundColor: ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b', '#ec4899'], borderWidth: 0 }] },
+        options: opts
       });
-
       if (horizonChart) horizonChart.destroy();
       horizonChart = new Chart(document.getElementById('horizonChart'), {
         type: 'bar',
-        data: {
-          labels: ['H1 (≤2 дн)', 'H2 (3–14 дн)', 'H3 (14+ дн)'],
-          datasets: [{
-            data: [data.horizon_distribution.H1, data.horizon_distribution.H2, data.horizon_distribution.H3],
-            backgroundColor: ['#ef4444', '#f59e0b', '#10b981'],
-            borderRadius: 8
-          }]
-        },
-        options: { ...commonOpts, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } }
+        data: { labels: ['H1 (≤2 дн)', 'H2 (3–14 дн)', 'H3 (14+ дн)'], datasets: [{ data: [data.horizon_distribution.H1, data.horizon_distribution.H2, data.horizon_distribution.H3], backgroundColor: ['#ef4444', '#f59e0b', '#10b981'], borderRadius: 8 }] },
+        options: { ...opts, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } }
       });
     }
-
     function renderJobs(jobs) {
       document.getElementById('jobsCount').textContent = `Показано вакансий: ${jobs.length}`;
-      const container = document.getElementById('jobsList');
-      if (!jobs.length) {
-        container.innerHTML = `<div class="empty-state">Нажмите «🧠 НАЙТИ ИСТОЧНИКИ И АДАПТЕРЫ» (Система 2) или «▶ ЗАПУСТИТЬ СБОР» (Система 1).</div>`;
-        return;
-      }
-      container.innerHTML = jobs.map(j => `
+      const el = document.getElementById('jobsList');
+      if (!jobs.length) { el.innerHTML = `<div class="empty-state">Вакансий по текущим фильтрам не найдено. Нажмите «↺ Сбросить» или запустите сбор.</div>`; return; }
+      el.innerHTML = jobs.map(j => `
         <div class="job-row">
-          <div class="score-badge ${j.match_score < 60 ? 'mid' : ''}">
-            ${j.match_score}%
-            <span>СОВПАДЕНИЕ</span>
-          </div>
+          <div class="score-badge ${j.match_score < 60 ? 'mid' : ''}">${j.match_score}%<span>СОВПАДЕНИЕ</span></div>
           <div>
             <div style="font-weight:700; font-size:15px;">${j.title}</div>
-            <div style="font-size:13px; color:#93c5fd; margin-top:2px;">🏛 ${j.institution} · 📍 ${j.location}</div>
+            <div style="font-size:13px; color:#93c5fd; margin-top:2px;">🏛 ${j.institution} · <span style="color:#c4b5fd;">${j.org_type || ''}</span> · 📍 ${j.location}</div>
             <div class="meta-pills">
-              <span class="pill">💶 ${j.pay_grade}</span>
-              <span class="pill">⏱ ${j.workload}</span>
-              <span class="pill">📄 ${j.contract}</span>
-              <span class="pill">📅 ${j.deadline}</span>
+              <span class="pill">💶 ${j.pay_grade}</span><span class="pill">⏱ ${j.workload}</span>
+              <span class="pill">📄 ${j.contract}</span><span class="pill">📅 ${j.deadline}</span>
               <span class="pill-src">⚙️ ${j.source_portal || 'System 1'}</span>
             </div>
             <div class="chip-row">
@@ -981,139 +777,56 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       `).join('');
     }
-
     async function openCoverLetter(jobId, lang) {
       currentLetterLang = lang;
-      document.getElementById('letterModalTitle').textContent =
-        lang === 'en' ? '✉ Cover Letter Draft (EN)' : '✉ Anschreiben-Entwurf (DE)';
-      document.getElementById('letterModalSub').textContent = 'Формируется с учётом вакансии и вашего CV...';
+      document.getElementById('letterModalTitle').textContent = lang === 'en' ? '✉ Cover Letter Draft (EN)' : '✉ Anschreiben-Entwurf (DE)';
+      document.getElementById('letterModalSub').textContent = 'Формируется...';
       document.getElementById('letterTextArea').value = '';
       document.getElementById('letterModal').classList.add('open');
-
-      const res = await fetch('/api/cover-letter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: jobId, lang })
-      });
-      const data = await res.json();
-      document.getElementById('letterModalSub').textContent =
-        `${data.institution || ''} · ${data.job_title || ''}`;
+      const data = await (await fetch('/api/cover-letter', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job_id: jobId, lang }) })).json();
+      document.getElementById('letterModalSub').textContent = `${data.institution || ''} · ${data.job_title || ''}`;
       document.getElementById('letterTextArea').value = data.letter || '';
     }
-
-    function closeLetterModal() {
-      document.getElementById('letterModal').classList.remove('open');
-    }
-
-    function copyLetterText() {
-      const ta = document.getElementById('letterTextArea');
-      ta.select();
-      document.execCommand('copy');
-    }
-
+    function closeLetterModal() { document.getElementById('letterModal').classList.remove('open'); }
+    function copyLetterText() { const ta = document.getElementById('letterTextArea'); ta.select(); document.execCommand('copy'); }
     function downloadLetterFile() {
-      const text = document.getElementById('letterTextArea').value || '';
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
+      a.href = URL.createObjectURL(new Blob([document.getElementById('letterTextArea').value || ''], { type: 'text/plain;charset=utf-8' }));
       a.download = currentLetterLang === 'en' ? 'Cover_Letter_EN.txt' : 'Anschreiben_DE.txt';
       a.click();
     }
-
     async function toggleHarvest() {
       await fetch('/api/harvest/toggle', { method: 'POST' });
       refreshDashboard();
-      const timer = setInterval(async () => {
-        const res = await fetch('/api/dashboard');
-        const d = await res.json();
-        refreshDashboard();
-        if (!d.harvest.running) clearInterval(timer);
-      }, 900);
+      const timer = setInterval(async () => { const d = await (await fetch('/api/dashboard')).json(); refreshDashboard(); if (!d.harvest.running) clearInterval(timer); }, 900);
     }
-
     async function runSystem2Discovery() {
       const btn = document.getElementById('sys2Btn');
       btn.textContent = '⏳ СИСТЕМА 2 СИНТЕЗИРУЕТ...';
       await fetch('/api/system2/discover', { method: 'POST' });
       refreshDashboard();
-      const timer = setInterval(async () => {
-        const res = await fetch('/api/dashboard');
-        const d = await res.json();
-        refreshDashboard();
-        if (!d.harvest.system2_busy && !d.harvest.running) {
-          btn.textContent = '🧠 НАЙТИ ИСТОЧНИКИ И АДАПТЕРЫ';
-          clearInterval(timer);
-        }
-      }, 1100);
+      const timer = setInterval(async () => { const d = await (await fetch('/api/dashboard')).json(); refreshDashboard(); if (!d.harvest.system2_busy && !d.harvest.running) { btn.textContent = '🧠 НАЙТИ ИСТОЧНИКИ И АДАПТЕРЫ'; clearInterval(timer); } }, 1100);
     }
-
     async function teachNewUrl() {
-      const input = document.getElementById('teachUrlInput');
-      const url = (input.value || '').trim();
+      const inp = document.getElementById('teachUrlInput');
+      const url = (inp.value || '').trim();
       if (!url) return;
-      document.getElementById('sys2Log').textContent = '⏳ Система 2 анализирует DOM и пишет адаптер...';
-      await fetch('/api/system2/teach', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url })
-      });
-      input.value = '';
+      document.getElementById('sys2Log').textContent = '⏳ Система 2 анализирует DOM...';
+      await fetch('/api/system2/teach', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+      inp.value = '';
       refreshDashboard();
     }
-
-    function startVoiceSearch() {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) {
-        alert('Голосовой ввод поддерживается в Microsoft Edge и Google Chrome.');
-        return;
-      }
-      const micBtn = document.getElementById('micBtn');
-      const recognition = new SpeechRecognition();
-      recognition.lang = 'ru-RU';
-      recognition.interimResults = false;
-
-      micBtn.classList.add('listening');
-      micBtn.innerHTML = '🔴 ГОВОРИТЕ СЕЙЧАС...';
-
-      recognition.onresult = async (event) => {
-        const transcript = event.results[0][0].transcript;
-        const parsedRes = await fetch('/api/voice/parse', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ transcript })
-        });
-        const parsed = await parsedRes.json();
-        document.getElementById('searchInput').value = parsed.filter_query || transcript;
-        document.getElementById('voiceChips').innerHTML =
-          `<span class="chip">🎙 «${transcript}»</span>` +
-          (parsed.detected_chips || []).map(c => `<span class="chip">${c}</span>`).join('');
-        refreshDashboard();
-      };
-
-      recognition.onend = () => {
-        micBtn.classList.remove('listening');
-        micBtn.innerHTML = '🎤 СКАЗАТЬ, ЧТО ИСКАТЬ';
-      };
-      recognition.start();
-    }
-
     async function uploadCVFile(file) {
       if (!file) return;
-      const formData = new FormData();
-      formData.append('file', file);
-      await fetch('/api/cv/upload', { method: 'POST', body: formData });
+      const fd = new FormData();
+      fd.append('file', file);
+      await fetch('/api/cv/upload', { method: 'POST', body: fd });
       refreshDashboard();
     }
-
     const dz = document.getElementById('dropZone');
     dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('dragover'); });
     dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
-    dz.addEventListener('drop', (e) => {
-      e.preventDefault();
-      dz.classList.remove('dragover');
-      if (e.dataTransfer.files.length) uploadCVFile(e.dataTransfer.files[0]);
-    });
-
+    dz.addEventListener('drop', (e) => { e.preventDefault(); dz.classList.remove('dragover'); if (e.dataTransfer.files.length) uploadCVFile(e.dataTransfer.files[0]); });
     refreshDashboard();
   </script>
 </body>
@@ -1128,10 +841,4 @@ async def index() -> HTMLResponse:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "admin_app:app",
-        host="127.0.0.1",
-        port=8090,
-        reload=True,
-        reload_excludes=["skills_registry/*", "data/*"],
-    )
+    uvicorn.run("admin_app:app", host="127.0.0.1", port=8090, reload=True, reload_excludes=["skills_registry/*", "data/*"])

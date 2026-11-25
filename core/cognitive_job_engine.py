@@ -1,11 +1,14 @@
 # File: core/cognitive_job_engine.py
-# Version: 0.4.1 | Release Date: 2026-11-24
-# EN: PyCognition v1.3.0 System 1 / System 2 Engine for Academic Job Harvester:
-#     Fixes initialization order so `self.stats` exists before `self.load_sources()` calls `self.save_sources()`.
-# DE: PyCognition v1.3.0 System-1/System-2-Engine für Academic Job Harvester (Initialisierungsreihenfolge korrigiert).
+# Version: 0.9.0 | Release Date: 2026-11-24
+# EN: Compact PyCognition v1.3.0 System 1 / System 2 engine orchestrating
+#     System2EscalationPolicy and ProgressiveSkillSynthesizer across discovered
+#     university and research portals with optional JS/Playwright rendering.
+# DE: Kompakter System-1/System-2-Kern v0.9.0 mit System2EscalationPolicy und
+#     ProgressiveSkillSynthesizer sowie optionalem JS/Playwright-Rendering.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import inspect
@@ -22,14 +25,21 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+try:
+    from playwright.async_api import async_playwright
+    _HAS_PLAYWRIGHT = True
+except ImportError:
+    async_playwright = None  # type: ignore
+    _HAS_PLAYWRIGHT = False
+
 _LOCAL_PYCOGNITION_SRC = Path(r"C:\Entwiklung\pycognition\src")
 if _LOCAL_PYCOGNITION_SRC.exists() and str(_LOCAL_PYCOGNITION_SRC) not in sys.path:
     sys.path.insert(0, str(_LOCAL_PYCOGNITION_SRC))
 
+from core.escalation_config import System2EscalationPolicy
+from core.skill_synthesizer import ProgressiveSkillSynthesizer
 from pycognition.skills import (
     AnomalyThresholds,
-    ExecutionScope,
-    SkillCapability,
     SkillCrystallizer,
     SkillExecutionTelemetry,
     TelemetryEvaluator,
@@ -39,14 +49,6 @@ logger = logging.getLogger("AcademicJobHarvester.CognitiveEngine")
 
 
 class CognitiveJobSkillEngine:
-    """
-    EN: Dual-process System 1 / System 2 engine powered by PyCognition v1.3.0:
-        - System 2 discovers academic job portals, synthesizes Python extractors,
-          and crystallizes them into `skills_registry/` after AST & sandbox checks.
-        - System 1 runs crystallized skills without LLM calls and monitors telemetry.
-    DE: Dual-Process System-1/System-2-Engine auf Basis von PyCognition v1.3.0.
-    """
-
     ALLOWED_SKILL_MODULES: Set[str] = {
         "bs4", "re", "json", "typing", "datetime", "urllib", "math", "html"
     }
@@ -82,70 +84,44 @@ class CognitiveJobSkillEngine:
             "location": "Göttingen (Niedersachsen)",
             "url": "https://www.uni-goettingen.de/de/305402.html",
         },
-        {
-            "name": "Universität Bremen Offene Stellen",
-            "institution": "Universität Bremen",
-            "location": "Bremen",
-            "url": "https://www.uni-bremen.de/universitaet/die-uni-als-arbeitgeber/offene-stellen",
-        },
-        {
-            "name": "Hochschule Bremen Stellenangebote",
-            "institution": "Hochschule Bremen",
-            "location": "Bremen",
-            "url": "https://www.hs-bremen.de/ueber-uns/karriere/stellenangebote/",
-        },
-        {
-            "name": "Hochschule Osnabrück Stellenangebote",
-            "institution": "Hochschule Osnabrück",
-            "location": "Osnabrück (Niedersachsen)",
-            "url": "https://www.hs-osnabrueck.de/wir/jobs-und-karriere/stellenangebote/",
-        },
-        {
-            "name": "Leuphana Universität Lüneburg Stellen",
-            "institution": "Leuphana Universität Lüneburg",
-            "location": "Lüneburg (Niedersachsen)",
-            "url": "https://www.leuphana.de/universitaet/jobs-und-karriere/wissenschaft.html",
-        },
-        {
-            "name": "TIB Hannover Stellenangebote",
-            "institution": "Technische Informationsbibliothek (TIB)",
-            "location": "Hannover (Niedersachsen)",
-            "url": "https://www.tib.eu/de/die-tib/karriere-und-ausbildung/aktuelle-stellenangebote",
-        },
     )
 
     DISCOVERY_DIRECTORIES: Tuple[str, ...] = (
+        "https://www.hrk.de/mitglieder/hochschulen-im-profil/",
+        "https://www.hochschulkompass.de/hochschulen/hochschulen-in-deutschland.html",
         "https://www.mwk.niedersachsen.de/startseite/hochschulen/hochschulen_in_niedersachsen/",
         "https://www.academics.de/jobs",
     )
 
+    UNIVERSITY_LINK_RE = re.compile(
+        r"(universitaet|universität|hochschule|tu-|rwth|lmu|kit|charite|charité|uni-|fh-|haw-)",
+        re.IGNORECASE,
+    )
     CAREER_LINK_HINT_RE = re.compile(
         r"(stellenangebot|offene[-_ ]stellen|stellenmarkt|karriere|vacanc|jobs|wissenschaftliche[-_ ]mitarbeiter)",
         re.IGNORECASE,
     )
-
     EXCLUDED_NOISE_RE = re.compile(
-        r"(/impressum|/datenschutz|/kontakt|/ueber-uns|/studium|/lehre|/presse|"
-        r"/aktuelles|/forschung/?$|/akademische-karrierewege/|/infoportal)",
+        r"(/impressum|/datenschutz|/kontakt|/ueber-uns|/studium|/lehre|/presse|/aktuelles|/forschung/?$|/akademische-karrierewege/|/infoportal)",
         re.IGNORECASE,
     )
-
     PAY_GRADE_RE = re.compile(
         r"\b(TV-?L\s*E?\s*1[345]|TVöD\s*E?\s*1[345]|E\s*1[345]|W\s*[123]|R[1234]|LfbA)\b",
         re.IGNORECASE,
     )
-
     WORKLOAD_RE = re.compile(
         r"\b(100\s*%|vollzeit|full[- ]?time|75\s*%|50\s*%|80\s*%|teilzeit)\b",
         re.IGNORECASE,
     )
 
-    def __init__(self, base_dir: Path, data_dir: Path) -> None:
+    def __init__(self, base_dir: Path, data_dir: Path, enable_js_rendering: bool = True) -> None:
         self.base_dir = base_dir
         self.data_dir = data_dir
+        self.enable_js_rendering = enable_js_rendering
         self.skills_dir = self.base_dir / "skills_registry"
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.registry_file = self.data_dir / "discovered_job_sources.json"
+        self.escalation_cfg_path = self.base_dir / "config" / "system2_escalation.json"
 
         self._load_dotenv_files()
         self.deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -167,7 +143,20 @@ class CognitiveJobSkillEngine:
         self.crystallizer = SkillCrystallizer(
             registry_dir=self.skills_dir,
             evaluator=self.telemetry_evaluator,
-            version_tag="0.4.1",
+            version_tag="0.9.0",
+        )
+        self.escalation_policy = System2EscalationPolicy(
+            config_path=self.escalation_cfg_path,
+            default_fast_model=self.fast_model,
+            default_reasoner_model=self.reasoner_model,
+        )
+        self.synthesizer = ProgressiveSkillSynthesizer(
+            crystallizer=self.crystallizer,
+            policy=self.escalation_policy,
+            allowed_modules=self.ALLOWED_SKILL_MODULES,
+            llm_caller=self._call_llm,
+            on_llm_call=lambda: self.stats.__setitem__("system2_llm_calls", self.stats["system2_llm_calls"] + 1),
+            on_synthesized=lambda: self.stats.__setitem__("system2_synthesized", self.stats["system2_synthesized"] + 1),
         )
 
         self._loaded_skills: Dict[str, Any] = {}
@@ -178,19 +167,16 @@ class CognitiveJobSkillEngine:
             "system2_synthesized": 0,
             "system2_repaired": 0,
             "system2_llm_calls": 0,
+            "system2_max_attempts": len(self.escalation_policy.steps),
+            "js_rendered_pages": 0,
+            "playwright_available": _HAS_PLAYWRIGHT,
             "discovered_sources_count": 0,
-            "last_system2_log": "Готов к автономному поиску источников и синтезу адаптеров",
+            "last_system2_log": f"Готов · Шагов эскалации S2: {len(self.escalation_policy.steps)}",
         }
-        initial_sources = self.load_sources()
-        self.stats["discovered_sources_count"] = len(initial_sources)
+        self.stats["discovered_sources_count"] = len(self.load_sources())
 
     def _load_dotenv_files(self) -> None:
-        candidates = (
-            self.base_dir / ".env",
-            self.base_dir.parent / "pycognition" / ".env",
-            self.base_dir.parent / "grant-harvester" / ".env",
-        )
-        for env_file in candidates:
+        for env_file in (self.base_dir / ".env", self.base_dir.parent / "pycognition" / ".env"):
             if not env_file.is_file():
                 continue
             for raw_line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -212,10 +198,7 @@ class CognitiveJobSkillEngine:
                     return data
             except Exception:
                 pass
-        initial = [
-            dict(item, enabled=True, discovered_by="Seed / Niedersachsen")
-            for item in self.CANDIDATE_ACADEMIC_HUBS
-        ]
+        initial = [dict(item, enabled=True, discovered_by="Seed / Niedersachsen") for item in self.CANDIDATE_ACADEMIC_HUBS]
         self.save_sources(initial)
         return initial
 
@@ -226,119 +209,124 @@ class CognitiveJobSkillEngine:
 
     def list_skills_status(self) -> List[Dict[str, Any]]:
         sources = self.load_sources()
-        result: List[Dict[str, Any]] = []
+        out: List[Dict[str, Any]] = []
         for src in sources:
-            skill_name = self.slugify_skill_name(src.get("name") or src.get("url") or "source")
-            skill_path = self.skills_dir / f"{skill_name}.py"
-            result.append({
+            sname = self.slugify_skill_name(src.get("name") or src.get("url") or "source")
+            out.append({
                 "name": src.get("name"),
                 "institution": src.get("institution"),
                 "location": src.get("location"),
                 "url": src.get("url"),
-                "skill_name": skill_name,
-                "crystallized": skill_path.is_file(),
+                "skill_name": sname,
+                "crystallized": (self.skills_dir / f"{sname}.py").is_file(),
                 "discovered_by": src.get("discovered_by", "System 2"),
             })
-        self.stats["system1_skills_count"] = sum(1 for r in result if r["crystallized"])
-        return result
+        self.stats["system1_skills_count"] = sum(1 for r in out if r["crystallized"])
+        return out
 
-    async def discover_and_build_adapters(self, max_new_sources: int = 4) -> Dict[str, Any]:
+    async def _fetch_page_html(self, client: httpx.AsyncClient, url: str, timeout: float = 9.0, prefer_js: bool = False) -> str:
+        http_html = ""
+        try:
+            resp = await client.get(url, timeout=timeout)
+            if resp.status_code == 200 and len(resp.text) > 250:
+                http_html = resp.text
+        except Exception:
+            http_html = ""
+        if self.enable_js_rendering and _HAS_PLAYWRIGHT and (prefer_js or not http_html):
+            rendered = await self._render_with_playwright(url)
+            if rendered and len(rendered) > len(http_html):
+                self.stats["js_rendered_pages"] += 1
+                return rendered
+        return http_html
+
+    async def _render_with_playwright(self, url: str, timeout_ms: int = 12000) -> str:
+        if not _HAS_PLAYWRIGHT or async_playwright is None:
+            return ""
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                try:
+                    page = await browser.new_page(locale="de-DE")
+                    await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                    await asyncio.sleep(0.5)
+                    return await page.content()
+                finally:
+                    await browser.close()
+        except Exception:
+            return ""
+
+    async def discover_and_build_adapters(self, max_new_sources: int = 6) -> Dict[str, Any]:
         sources = self.load_sources()
-        known_urls = {str(s.get("url") or "").rstrip("/").lower() for s in sources}
-        newly_discovered = 0
-        newly_synthesized = 0
-
+        known = {str(s.get("url") or "").rstrip("/").lower() for s in sources}
+        newly_disc = newly_syn = 0
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=7.0),
+            timeout=httpx.Timeout(14.0, connect=6.0),
             follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-                ),
-                "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8",
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
             for dir_url in self.DISCOVERY_DIRECTORIES:
-                if newly_discovered >= max_new_sources:
+                if newly_disc >= max_new_sources:
                     break
                 try:
-                    resp = await client.get(dir_url, timeout=9.0)
-                    if resp.status_code != 200:
+                    html = await self._fetch_page_html(client, dir_url, timeout=9.0)
+                    if not html:
                         continue
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    for a in soup.find_all("a", href=True):
+                    dir_host = urlparse(dir_url).netloc.lower()
+                    for a in BeautifulSoup(html, "html.parser").find_all("a", href=True):
+                        if newly_disc >= max_new_sources:
+                            break
                         href = urljoin(dir_url, str(a["href"]).strip()).split("#")[0]
-                        norm_h = href.rstrip("/").lower()
-                        if norm_h in known_urls or not href.startswith(("https://", "http://")):
-                            continue
-                        anchor_txt = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
-                        if not (
-                            self.CAREER_LINK_HINT_RE.search(href)
-                            or self.CAREER_LINK_HINT_RE.search(anchor_txt)
-                        ):
+                        if not href.startswith(("https://", "http://")) or href.rstrip("/").lower() in known:
                             continue
                         host = urlparse(href).netloc.lower()
-                        if not any(tld in host for tld in (".de", ".eu", ".org", ".ac.")):
+                        if not host or host == dir_host or not any(t in host for t in (".de", ".eu", ".org", ".ac.")):
                             continue
-                        inst_label = anchor_txt if 4 <= len(anchor_txt) <= 90 else host
+                        txt = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip()
+                        if not (
+                            self.CAREER_LINK_HINT_RE.search(href)
+                            or self.CAREER_LINK_HINT_RE.search(txt)
+                            or self.UNIVERSITY_LINK_RE.search(f"{host} {txt}")
+                        ):
+                            continue
+                        label = txt if 4 <= len(txt) <= 85 else host
                         sources.append({
-                            "name": f"{inst_label} ({host})",
-                            "institution": inst_label,
-                            "location": "Deutschland / EU",
+                            "name": f"{label} ({host})",
+                            "institution": label,
+                            "location": "Deutschland (HRK)",
                             "url": href,
                             "enabled": True,
-                            "discovered_by": "System 2 Link Miner",
+                            "discovered_by": f"System 2 ({dir_host})",
                         })
-                        known_urls.add(norm_h)
-                        newly_discovered += 1
-                        if newly_discovered >= max_new_sources:
-                            break
+                        known.add(href.rstrip("/").lower())
+                        newly_disc += 1
                 except Exception as exc:
-                    logger.debug(f"[System 2 Discovery] Directory probe skipped ({dir_url}): {exc}")
-
-            if newly_discovered > 0:
+                    logger.debug(f"[Discovery] {dir_url}: {exc}")
+            if newly_disc:
                 self.save_sources(sources)
-
             for src in sources:
                 if not src.get("enabled", True):
                     continue
-                src_name = str(src.get("name") or src.get("url"))
-                src_url = str(src.get("url") or "")
-                skill_name = self.slugify_skill_name(src_name)
-                if (self.skills_dir / f"{skill_name}.py").is_file():
+                sname = self.slugify_skill_name(src.get("name") or src.get("url") or "src")
+                if (self.skills_dir / f"{sname}.py").is_file():
                     continue
-
-                ok = await self._synthesize_skill_for_url(
-                    client=client,
-                    skill_name=skill_name,
-                    source_name=src_name,
-                    url=src_url,
+                res = await self._synthesize_skill_for_url(
+                    client, sname, str(src.get("name") or src.get("url")), str(src.get("url") or "")
                 )
-                if ok:
-                    newly_synthesized += 1
-
+                if res.get("accepted"):
+                    newly_syn += 1
         self.list_skills_status()
         self.stats["last_system2_log"] = (
-            f"Система 2: найдено источников +{newly_discovered}, "
-            f"синтезировано AST-адаптеров +{newly_synthesized} (всего скиллов: {self.stats['system1_skills_count']})"
+            f"Система 2 ({len(self.escalation_policy.steps)} шагов): +{newly_disc} источников, +{newly_syn} скиллов"
         )
-        return {
-            "newly_discovered": newly_discovered,
-            "newly_synthesized": newly_synthesized,
-            "total_skills": self.stats["system1_skills_count"],
-            "llm_mode": "DeepSeek System 2" if self.deepseek_api_key else "Deterministic Structural Synthesizer",
-        }
+        return {"newly_discovered": newly_disc, "newly_synthesized": newly_syn, "total_skills": self.stats["system1_skills_count"]}
 
     async def teach_new_source(self, url: str, name: str = "", location: str = "Deutschland / EU") -> Dict[str, Any]:
         clean_url = url.strip()
         if not clean_url.startswith(("http://", "https://")):
             clean_url = f"https://{clean_url}"
-
         host = urlparse(clean_url).netloc or "custom-portal"
         clean_name = name.strip() or f"Portal {host}"
-        skill_name = self.slugify_skill_name(clean_name)
-
+        sname = self.slugify_skill_name(clean_name)
         sources = self.load_sources()
         if not any(str(s.get("url")).rstrip("/").lower() == clean_url.rstrip("/").lower() for s in sources):
             sources.insert(0, {
@@ -350,30 +338,25 @@ class CognitiveJobSkillEngine:
                 "discovered_by": "User Taught -> System 2",
             })
             self.save_sources(sources)
-
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(16.0, connect=7.0),
+            timeout=httpx.Timeout(18.0, connect=7.0),
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
-            synthesized = await self._synthesize_skill_for_url(
-                client=client,
-                skill_name=skill_name,
-                source_name=clean_name,
-                url=clean_url,
-                force_rebuild=True,
-            )
-
+            res = await self._synthesize_skill_for_url(client, sname, clean_name, clean_url, force_rebuild=True)
         self.list_skills_status()
-        self.stats["last_system2_log"] = (
-            f"Система 2 обучена для «{clean_name}» -> скилл {skill_name}.py "
-            f"({'успешно кристаллизован' if synthesized else 'ошибка синтеза'})"
-        )
+        ok = bool(res.get("accepted"))
+        att = res.get("attempt")
+        tot = res.get("total_attempts")
+        mdl = res.get("model")
+        rsn = res.get("reason", "ошибка")
+        self.stats["last_system2_log"] = f"Система 2 («{clean_name}», шаг {att}/{tot}, {mdl}): {rsn}"
         return {
-            "status": "ok" if synthesized else "failed",
-            "skill_name": skill_name,
+            "status": "ok" if ok else "failed",
+            "skill_name": sname,
             "source_name": clean_name,
             "url": clean_url,
+            "escalation": res,
         }
 
     async def _synthesize_skill_for_url(
@@ -386,193 +369,25 @@ class CognitiveJobSkillEngine:
         diagnostic_report: str = "",
         baseline_valid_count: int = 0,
         force_rebuild: bool = False,
-    ) -> bool:
-        try:
-            resp = await client.get(url, timeout=10.0)
-            if resp.status_code != 200 or len(resp.text) < 400:
-                return False
-            html = resp.text
-        except Exception as exc:
-            logger.warning(f"[System 2] Cannot fetch {url}: {exc}")
-            return False
-
-        candidate_code = ""
-        if self.deepseek_api_key:
-            candidate_code = await self._synthesize_via_deepseek(
-                skill_name=skill_name,
-                source_name=source_name,
-                url=url,
-                html=html,
-                current_code=current_code,
-                diagnostic_report=diagnostic_report,
-            )
-
-        if not candidate_code:
-            candidate_code = self._build_deterministic_extractor_code(source_name=source_name, seed_url=url)
-
+    ) -> Dict[str, Any]:
+        html = await self._fetch_page_html(client, url, timeout=10.0)
+        if not html or len(html) < 400:
+            return {"accepted": False, "reason": "empty HTML"}
         if force_rebuild:
-            existing_file = self.skills_dir / f"{skill_name}.py"
-            if existing_file.exists():
-                existing_file.unlink()
+            p = self.skills_dir / f"{skill_name}.py"
+            if p.exists():
+                p.unlink()
             self._loaded_skills.pop(skill_name, None)
-
-        capability = SkillCapability(
-            skill_name=skill_name,
-            allowed_scope=ExecutionScope.PARSE_DATA,
-            allowed_modules=set(self.ALLOWED_SKILL_MODULES),
-            required_entrypoint="extract",
+        res = await self.synthesizer.synthesize_with_escalation(
+            skill_name, source_name, url, html, self.deepseek_api_key, current_code, diagnostic_report, baseline_valid_count
         )
-        cryst_result = self.crystallizer.crystallize(
-            source_code=candidate_code,
-            capability=capability,
-            sample_args=(html, url),
-            target_uri=url,
-            baseline_valid_count=baseline_valid_count,
-            max_allowed_corruption=0.25,
-            source_label=source_name,
-        )
-
-        if not cryst_result.accepted and self.deepseek_api_key:
-            fallback_code = self._build_deterministic_extractor_code(source_name=source_name, seed_url=url)
-            cryst_result = self.crystallizer.crystallize(
-                source_code=fallback_code,
-                capability=capability,
-                sample_args=(html, url),
-                target_uri=url,
-                baseline_valid_count=baseline_valid_count,
-                max_allowed_corruption=0.25,
-                source_label=source_name,
-            )
-
-        if cryst_result.accepted:
-            self.stats["system2_synthesized"] += 1
+        if res.get("accepted"):
             self._loaded_skills.pop(skill_name, None)
-            return True
+        return res
 
-        logger.warning(f"[SkillCrystallizer] Rejected '{skill_name}': {cryst_result.reason}")
-        return False
-
-    async def _synthesize_via_deepseek(
-        self,
-        skill_name: str,
-        source_name: str,
-        url: str,
-        html: str,
-        current_code: Optional[str],
-        diagnostic_report: str,
-    ) -> str:
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "svg", "noscript", "iframe", "meta", "link"]):
-            tag.decompose()
-        main_node = soup.find("main") or soup.find("body") or soup
-        distilled_dom = re.sub(r"\n\s*\n+", "\n", str(main_node))[:20000]
-
-        existing_block = ""
-        if current_code:
-            existing_block = "Current code:\n```python\n" + current_code + "\n```\n"
-
-        self.stats["system2_llm_calls"] += 1
-        raw_reply = await self._call_llm(
-            model=self.reasoner_model,
-            system_prompt=(
-                "You are the System 2 Cognitive Architect of PyCognition. Write a deterministic Python "
-                "extractor for academic/university job postings using BeautifulSoup and urllib.parse.urljoin.\n"
-                "STRICT AST SECURITY RULES:\n"
-                "1. Define `def extract(html: str, base_url: str) -> list[dict]:`.\n"
-                "2. Allowed imports ONLY: `bs4`, `re`, `json`, `typing`, `datetime`, `urllib.parse`, `html`.\n"
-                "3. NEVER import `os`, `sys`, `subprocess`, `requests`, `httpx`, or `pathlib`.\n"
-                "4. Extract ONLY individual job postings (PDFs or job detail pages). Reject navigation links, "
-                "imprint, privacy, or general research overview pages.\n"
-                "5. Each dict must include: `title`, `link`, `institution`, `pay_grade`, `workload`, `deadline`, `description`.\n"
-                "6. Output ONLY valid Python code inside ```python ... ```."
-            ),
-            user_prompt=(
-                f"Source: {source_name}\nURL: {url}\n"
-                f"Diagnostics: {diagnostic_report or 'Initial synthesis'}\n"
-                f"{existing_block}"
-                f"DOM:\n```html\n{distilled_dom}\n```"
-            ),
-        )
-        m = re.search(r"```python\s*(.*?)```", raw_reply, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
-    @staticmethod
-    def _build_deterministic_extractor_code(source_name: str, seed_url: str) -> str:
-        safe_source = source_name.replace('"', "'")
-        safe_seed = seed_url.replace('"', "'")
-        return f"""# Crystallized System 1 Job Skill for {safe_source}
-import re
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-
-POSTING_RE = re.compile(
-    r"(/job/|/jobs/[^/]+|/stellenangebote/[^/]+|/stelle/[^/]+|/stellenangebot/|"
-    r"/karriere/[^/]+|/vacanc|/position/|/offene-stellen/[^/]+|/jobboerse/|"
-    r"stellenangebote/.*\\.pdf$|stellen/.*\\.pdf$)",
-    re.IGNORECASE,
-)
-NOISE_RE = re.compile(
-    r"(/impressum|/datenschutz|/kontakt|/ueber-uns|/studium|/lehre|/presse|"
-    r"/aktuelles|/forschung/?$|/akademische-karrierewege/|/infoportal|/jobs\\.html$)",
-    re.IGNORECASE,
-)
-GRADE_RE = re.compile(r"\\b(TV-?L\\s*E?\\s*1[345]|TVöD\\s*E?\\s*1[345]|E\\s*1[345]|W\\s*[123]|LfbA)\\b", re.IGNORECASE)
-WORKLOAD_RE = re.compile(r"\\b(100\\s*%|vollzeit|75\\s*%|50\\s*%|80\\s*%|teilzeit)\\b", re.IGNORECASE)
-DEADLINE_RE = re.compile(r"(?:bewerbungsfrist|frist|bis zum|deadline)[:\\s]*([0-3]?\\d\\.[01]?\\d\\.20\\d{{2}}|20\\d{{2}}-[01]\\d-[0-3]\\d)", re.IGNORECASE)
-
-
-def extract(html: str, base_url: str = "{safe_seed}") -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    results = []
-    seen = set()
-    base_clean = base_url.rstrip("/").lower()
-
-    for a in soup.find_all("a", href=True):
-        raw_href = str(a["href"]).strip()
-        if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            continue
-        full_url = urljoin(base_url, raw_href).split("#")[0]
-        if full_url in seen or full_url.rstrip("/").lower() == base_clean:
-            continue
-        parsed = urlparse(full_url)
-        if parsed.scheme not in ("http", "https") or not parsed.path or parsed.path in ("/", "/de", "/de/"):
-            continue
-        if NOISE_RE.search(parsed.path):
-            continue
-        path_q = f"{{parsed.path}}?{{parsed.query}}" if parsed.query else parsed.path
-        if not POSTING_RE.search(path_q):
-            continue
-
-        txt = re.sub(r"\\s+", " ", a.get_text(" ", strip=True)).strip()
-        txt = re.sub(r"\\s*\\(PDF[^)]*\\)\\s*$", "", txt, flags=re.IGNORECASE).strip()
-        if len(txt) < 10 or len(txt) > 220:
-            continue
-
-        parent = a.find_parent(["tr", "li", "article", "div"])
-        ctx = re.sub(r"\\s+", " ", parent.get_text(" ", strip=True)).strip() if parent else txt
-        combined = f"{{txt}} {{ctx}}"
-
-        gm = GRADE_RE.search(combined)
-        wm = WORKLOAD_RE.search(combined)
-        dm = DEADLINE_RE.search(combined)
-
-        seen.add(full_url)
-        results.append({{
-            "title": txt,
-            "link": full_url,
-            "institution": "{safe_source}",
-            "pay_grade": re.sub(r"\\s+", " ", gm.group(0)).upper() if gm else "TV-L / Tarif",
-            "workload": re.sub(r"\\s+", " ", wm.group(0)).upper() if wm else "Siehe Ausschreibung",
-            "deadline": dm.group(1) if dm else "Siehe Ausschreibung",
-            "description": ctx[:450],
-        }})
-    return results
-"""
-
-    async def _call_llm(self, model: str, system_prompt: str, user_prompt: str) -> str:
+    async def _call_llm(self, model: str, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
         if not self.deepseek_api_key:
             return ""
-        endpoint = f"{self.deepseek_base_url}/chat/completions"
         payload: Dict[str, Any] = {
             "model": model,
             "messages": [
@@ -581,186 +396,101 @@ def extract(html: str, base_url: str = "{safe_seed}") -> list[dict]:
             ],
         }
         if "reasoner" not in model.lower():
-            payload["temperature"] = 0.1
+            payload["temperature"] = temperature
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=12.0)) as client:
                 resp = await client.post(
-                    endpoint,
+                    f"{self.deepseek_base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.deepseek_api_key}", "Content-Type": "application/json"},
                     json=payload,
                 )
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]["content"] or ""
         except Exception as exc:
-            logger.error(f"[System 2 LLM Error] {exc}")
+            logger.error(f"[LLM] {exc}")
             return ""
 
     async def run_system1_harvest(self) -> List[Dict[str, Any]]:
         sources = self.load_sources()
-        all_records: List[Dict[str, Any]] = []
-        seen_urls: Set[str] = set()
-        total_exec_ms = 0.0
-        exec_count = 0
-
+        records: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        total_ms = 0.0
+        runs = 0
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(12.0, connect=6.0),
             follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-                ),
-                "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8",
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
         ) as client:
             for src in sources:
                 if not src.get("enabled", True):
                     continue
-                src_name = str(src.get("name") or src.get("url"))
-                inst_name = str(src.get("institution") or src_name)
-                loc_str = str(src.get("location") or "Deutschland")
-                src_url = str(src.get("url") or "")
-                skill_name = self.slugify_skill_name(src_name)
-
-                skill_mod = self._load_skill_module(skill_name)
-                if skill_mod is None:
-                    synthesized = await self._synthesize_skill_for_url(
-                        client=client,
-                        skill_name=skill_name,
-                        source_name=src_name,
-                        url=src_url,
-                    )
-                    if synthesized:
-                        skill_mod = self._load_skill_module(skill_name, force_reload=True)
-                if skill_mod is None:
+                sname = self.slugify_skill_name(src.get("name") or src.get("url") or "src")
+                surl = str(src.get("url") or "")
+                mod = self._load_skill_module(sname)
+                if mod is None:
+                    syn = await self._synthesize_skill_for_url(client, sname, str(src.get("name") or surl), surl)
+                    if syn.get("accepted"):
+                        mod = self._load_skill_module(sname, force_reload=True)
+                if mod is None:
                     continue
-
-                try:
-                    resp = await client.get(src_url, timeout=9.0)
-                    if resp.status_code != 200 or len(resp.text) < 300:
-                        continue
-                    html = resp.text
-                except Exception:
+                html = await self._fetch_page_html(client, surl, timeout=9.0)
+                if not html or len(html) < 300:
                     continue
-
                 t0 = time.perf_counter()
-                telemetry = self._execute_skill(skill_mod, skill_name, src_url, html)
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                total_exec_ms += elapsed_ms
-                exec_count += 1
-
-                if telemetry.is_degraded:
-                    logger.warning(f"[System 2 Self-Healing] Repairing degraded skill '{skill_name}'...")
-                    current_code = (self.skills_dir / f"{skill_name}.py").read_text(encoding="utf-8", errors="ignore")
-                    repaired = await self._synthesize_skill_for_url(
-                        client=client,
-                        skill_name=skill_name,
-                        source_name=src_name,
-                        url=src_url,
-                        current_code=current_code,
-                        diagnostic_report=telemetry.to_diagnostic_prompt(),
-                        baseline_valid_count=telemetry.valid_count,
-                        force_rebuild=True,
+                tel = self._execute_skill(mod, sname, surl, html)
+                total_ms += (time.perf_counter() - t0) * 1000.0
+                runs += 1
+                for item in tel.valid_records:
+                    norm = self._normalize_skill_record(
+                        item,
+                        str(src.get("institution") or sname),
+                        str(src.get("location") or "Deutschland"),
+                        str(src.get("name") or surl),
                     )
-                    if repaired:
-                        self.stats["system2_repaired"] += 1
-                        skill_mod = self._load_skill_module(skill_name, force_reload=True)
-                        if skill_mod is not None:
-                            telemetry = self._execute_skill(skill_mod, skill_name, src_url, html)
-
-                for item in telemetry.valid_records:
-                    norm = self._normalize_skill_record(item, inst_name, loc_str, src_name)
-                    if norm and norm["url"] not in seen_urls:
-                        seen_urls.add(norm["url"])
-                        all_records.append(norm)
-
-        self.stats["system1_executions"] += exec_count
-        if exec_count > 0:
-            self.stats["system1_avg_ms"] = round(total_exec_ms / exec_count, 2)
+                    if norm and norm["url"] not in seen:
+                        seen.add(norm["url"])
+                        records.append(norm)
+        self.stats["system1_executions"] += runs
+        if runs:
+            self.stats["system1_avg_ms"] = round(total_ms / runs, 2)
         self.list_skills_status()
-        return all_records
+        return records
 
-    def _execute_skill(
-        self,
-        skill_module: Any,
-        skill_name: str,
-        url: str,
-        html: str,
-    ) -> SkillExecutionTelemetry:
-        extract_fn = getattr(skill_module, "extract", None)
-        if not callable(extract_fn):
-            return self.telemetry_evaluator.evaluate(
-                skill_name=skill_name,
-                target_uri=url,
-                raw_output=None,
-                execution_error="Missing callable extract(html, base_url).",
-            )
+    def _execute_skill(self, skill_module: Any, skill_name: str, url: str, html: str) -> SkillExecutionTelemetry:
+        fn = getattr(skill_module, "extract", None)
+        if not callable(fn):
+            return self.telemetry_evaluator.evaluate(skill_name, url, None, "Missing extract")
         try:
-            sig = inspect.signature(extract_fn)
-            raw_out = extract_fn(html, url) if len(sig.parameters) >= 2 else extract_fn(html)
-            return self.telemetry_evaluator.evaluate(
-                skill_name=skill_name,
-                target_uri=url,
-                raw_output=raw_out,
-                execution_error=None,
-            )
+            sig = inspect.signature(fn)
+            raw = fn(html, url) if len(sig.parameters) >= 2 else fn(html)
+            return self.telemetry_evaluator.evaluate(skill_name, url, raw, None)
         except Exception as exc:
-            return self.telemetry_evaluator.evaluate(
-                skill_name=skill_name,
-                target_uri=url,
-                raw_output=None,
-                execution_error=f"{type(exc).__name__}: {exc}",
-            )
+            return self.telemetry_evaluator.evaluate(skill_name, url, None, f"{type(exc).__name__}: {exc}")
 
     @classmethod
     def _validate_job_candidate(cls, record: Dict[str, Any]) -> bool:
         title = re.sub(r"\s+", " ", str(record.get("title") or "")).strip()
         link = str(record.get("link") or record.get("url") or "").strip()
-        if len(title) < 8 or len(title) > 240:
+        if len(title) < 8 or len(title) > 240 or not link.startswith(("https://", "http://")):
             return False
-        if not link.startswith(("https://", "http://")):
-            return False
-        parsed = urlparse(link)
-        if cls.EXCLUDED_NOISE_RE.search(parsed.path):
-            return False
-        return True
+        return not bool(cls.EXCLUDED_NOISE_RE.search(urlparse(link).path))
 
-    def _normalize_skill_record(
-        self,
-        raw: Dict[str, Any],
-        institution: str,
-        location: str,
-        source_portal: str,
-    ) -> Optional[Dict[str, Any]]:
+    def _normalize_skill_record(self, raw: Dict[str, Any], institution: str, location: str, source_portal: str) -> Optional[Dict[str, Any]]:
         title = re.sub(r"\s+", " ", str(raw.get("title") or "")).strip()
         url = str(raw.get("link") or raw.get("url") or "").strip()
         if len(title) < 8 or not url.startswith(("https://", "http://")):
             return None
-
         desc = re.sub(r"\s+", " ", str(raw.get("description") or title)).strip()
-        combined = f"{title} {desc} {institution}"
-        gm = self.PAY_GRADE_RE.search(combined)
-        wm = self.WORKLOAD_RE.search(combined)
-
-        pay_grade = str(raw.get("pay_grade") or "").strip() or (
-            re.sub(r"\s+", " ", gm.group(0)).upper() if gm else "TV-L / Tarif"
-        )
-        workload = str(raw.get("workload") or "").strip() or (
-            re.sub(r"\s+", " ", wm.group(0)).upper() if wm else "Siehe Ausschreibung"
-        )
-        deadline = str(raw.get("deadline") or "Siehe Ausschreibung").strip()
-        native_id = hashlib.sha256(url.lower().encode("utf-8")).hexdigest()[:16]
-
-        tags = [
-            tok.lower()
-            for tok in re.findall(r"[A-Za-zÄÖÜäöüß0-9\-\+]{3,}", f"{title} {institution} {pay_grade}")
-            if len(tok) >= 3
-        ][:12]
-
+        comb = f"{title} {desc} {institution}"
+        gm, wm = self.PAY_GRADE_RE.search(comb), self.WORKLOAD_RE.search(comb)
+        pay_grade = str(raw.get("pay_grade") or "").strip() or (re.sub(r"\s+", " ", gm.group(0)).upper() if gm else "TV-L / Tarif")
+        workload = str(raw.get("workload") or "").strip() or (re.sub(r"\s+", " ", wm.group(0)).upper() if wm else "Siehe Ausschreibung")
+        nid = hashlib.sha256(url.lower().encode("utf-8")).hexdigest()[:16]
+        tags = [t.lower() for t in re.findall(r"[A-Za-zÄÖÜäöüß0-9\-\+]{3,}", f"{title} {institution} {pay_grade}")][:12]
         return {
-            "id": f"s1-{native_id}",
-            "native_id": native_id,
-            "kennziffer": native_id[:10].upper(),
+            "id": f"s1-{nid}",
+            "native_id": nid,
+            "kennziffer": nid[:10].upper(),
             "title": title[:220],
             "institution": institution[:160],
             "funder": institution[:160],
@@ -769,7 +499,7 @@ def extract(html: str, base_url: str = "{safe_seed}") -> list[dict]:
             "workload": workload[:40],
             "contract": "PDF / Ausschreibung" if url.lower().endswith(".pdf") else "System 1 Skill",
             "horizon": "H2",
-            "deadline": deadline[:40],
+            "deadline": str(raw.get("deadline") or "Siehe Ausschreibung")[:40],
             "tags": tags,
             "link": url,
             "url": url,
@@ -780,17 +510,17 @@ def extract(html: str, base_url: str = "{safe_seed}") -> list[dict]:
 
     @staticmethod
     def slugify_skill_name(source_name: str) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "_", source_name.lower()).strip("_")
-        return f"job_skill_{slug[:50]}"
+        cleaned = re.sub(r"\W+", "_", source_name.lower()).strip("_")[:50]
+        return f"job_skill_{cleaned}"
 
     def _load_skill_module(self, skill_name: str, force_reload: bool = False) -> Optional[Any]:
         if not force_reload and skill_name in self._loaded_skills:
             return self._loaded_skills[skill_name]
-        skill_path = self.skills_dir / f"{skill_name}.py"
-        if not skill_path.is_file():
+        p = self.skills_dir / f"{skill_name}.py"
+        if not p.is_file():
             return None
         try:
-            spec = importlib.util.spec_from_file_location(skill_name, str(skill_path))
+            spec = importlib.util.spec_from_file_location(skill_name, str(p))
             if spec is None or spec.loader is None:
                 return None
             mod = importlib.util.module_from_spec(spec)
@@ -799,5 +529,5 @@ def extract(html: str, base_url: str = "{safe_seed}") -> list[dict]:
             self._loaded_skills[skill_name] = mod
             return mod
         except Exception as exc:
-            logger.error(f"Failed to load skill '{skill_name}': {exc}")
+            logger.error(f"Skill load error {skill_name}: {exc}")
             return None

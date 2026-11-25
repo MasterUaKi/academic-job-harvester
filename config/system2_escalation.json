@@ -1,0 +1,47 @@
+{
+  "version": "0.9.0",
+  "release_date": "2026-11-24",
+  "max_attempts": 5,
+  "escalation_steps": [
+    {
+      "attempt": 1,
+      "mode": "deterministic_structural",
+      "model": null,
+      "temperature": 0.0,
+      "dom_char_limit": 12000,
+      "description": "Шаг 1: простой детерминированный структурный экстрактор"
+    },
+    {
+      "attempt": 2,
+      "mode": "llm",
+      "model": "deepseek-chat",
+      "temperature": 0.1,
+      "dom_char_limit": 16000,
+      "description": "Шаг 2: базовая LLM-модель на компактном DOM"
+    },
+    {
+      "attempt": 3,
+      "mode": "llm",
+      "model": "deepseek-chat",
+      "temperature": 0.2,
+      "dom_char_limit": 24000,
+      "description": "Шаг 3: расширенный DOM + диагностика прошлой попытки"
+    },
+    {
+      "attempt": 4,
+      "mode": "llm",
+      "model": "deepseek-reasoner",
+      "temperature": 0.1,
+      "dom_char_limit": 28000,
+      "description": "Шаг 4: более сильная модель (deepseek-reasoner)"
+    },
+    {
+      "attempt": 5,
+      "mode": "llm",
+      "model": "deepseek-reasoner",
+      "temperature": 0.25,
+      "dom_char_limit": 36000,
+      "description": "Шаг 5: глубокая эскалация с максимальным DOM и разбором ошибок"
+    }
+  ]
+}
